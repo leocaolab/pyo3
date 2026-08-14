@@ -337,6 +337,34 @@ freelist / `#[pyclass(frozen)]` 零开销借用 / `METH_FASTCALL` / `likely`-`co
 
 **把它们混进这个分支再和没加的上游比,是不诚实的基准,而且会让 PR 没法评审。** 一个 PR 只改一件事。
 
+## 七、当前状态
+
+| | 上游 PyO3 0.29.2 | 本分支 |
+|---|---|---|
+| `#[pyclass]` 类型(8 个解释器) | 1 个,共享 | **8 个,独立** |
+| 异常类型(8 个解释器) | 1 个,共享 | **8 个,独立** |
+| 并发压测(8 × 2000 次调用) | **SIGSEGV / abort** | 正常 |
+| 内存回收(16 个解释器) | 48.0% | **51.1%** |
+| 长跑(4000 个解释器) | — | +24.8 MB,斜率 +3.4 MB/千轮,收敛 |
+| `pyclass_create` | 25.87 ns | **25.17 ns** |
+| 上游测试套件 | 850 passed | **850 passed, 0 failed** |
+
+**没有已知回归。**
+
+### 还没做
+
+- `wrap_pymodule!` 的守卫仍在 —— 子模块仍拒绝子解释器(polars 卡的就是这个)
+- 仍需 `_override_multi_interp_extensions_check(-1)`,因为没声明 `Py_MOD_PER_INTERPRETER_GIL_SUPPORTED`
+- 只在 macOS ARM64 / Python 3.14.6 验证过
+- 剩余 79 处 cache site 里,`Py<PyAny>` / `Py<PyTzInfo>` / `Py<PyModule>` 等约 20 处未做运行时判定
+- 多解释器**并发**下的 bench 没做 —— 只测了单线程热路径
+
+### 和这个修复无关的
+
+numpy / pandas / scipy / pyarrow 仍然需要物理副本 —— 那是 Cython 守卫和进程级 C 全局态,不在 PyO3 这一层。
+
+---
+
 ## 八、方法上的教训
 
 1. **"能跑 + 结果对" ≠ "隔离了"。** 功能测试全绿的同时,8 个解释器在共享一个 type 对象。**测对象身份(地址、refcount、tp_flags),不要只测输出。**
