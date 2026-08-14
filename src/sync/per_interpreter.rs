@@ -40,6 +40,12 @@ const CAPSULE_NAME: &CStr = c"pyo3.per_interpreter.cell";
 /// Unlike `PyOnceLock`, a value written by one interpreter is invisible to every other
 /// interpreter, and is destroyed when the interpreter that created it is finalized.
 pub struct PerInterpreterCell<T> {
+    /// Gives the cell a non-zero size so that each cell has a distinct address.
+    ///
+    /// The address is the storage key, and two zero-sized fields of the same struct may share
+    /// one address — which would silently make two cells alias. `AtomicU8` also stops the
+    /// linker from merging identical statics.
+    _identity: core::sync::atomic::AtomicU8,
     _marker: core::marker::PhantomData<fn() -> T>,
 }
 
@@ -53,6 +59,7 @@ impl<T> PerInterpreterCell<T> {
     /// Creates a cell with no value in any interpreter.
     pub const fn new() -> Self {
         PerInterpreterCell {
+            _identity: core::sync::atomic::AtomicU8::new(0),
             _marker: core::marker::PhantomData,
         }
     }
@@ -151,40 +158,46 @@ impl<T> PerInterpreterCell<T> {
 
     /// Stores `value` for this interpreter and returns a reference to whatever is stored
     /// afterwards — which may be a value another thread of this interpreter installed first.
+    ///
+    /// Every fallible step runs *before* the capsule is created, so the only failure that can
+    /// happen while the capsule owns the box clears the destructor before releasing it. A value
+    /// that cannot be stored is leaked rather than dropped: callers hold a `&T` derived from it,
+    /// so dropping would hand back a dangling reference.
     fn set_and_get(&self, py: Python<'_>, value: T) -> &T {
+        let boxed = Box::into_raw(Box::new(value));
         unsafe {
-            let boxed = Box::into_raw(Box::new(value));
-            let capsule =
-                ffi::PyCapsule_New(boxed as *mut c_void, CAPSULE_NAME.as_ptr(), Some(destructor::<T>));
+            let registry = Self::registry(py);
+            if registry.is_null() {
+                return &*boxed; // leaked
+            }
+            if let Some(existing) = self.get(py) {
+                drop(Box::from_raw(boxed));
+                return existing;
+            }
+            let key = ffi::PyLong_FromSize_t(self.key());
+            if key.is_null() {
+                ffi::PyErr_Clear();
+                return &*boxed; // leaked
+            }
+            let capsule = ffi::PyCapsule_New(
+                boxed as *mut c_void,
+                CAPSULE_NAME.as_ptr(),
+                Some(destructor::<T>),
+            );
             if capsule.is_null() {
                 ffi::PyErr_Clear();
-                // Cannot store it; hand back the leaked box rather than returning a dangling
-                // reference. This only happens under memory exhaustion.
-                return &*boxed;
-            }
-            let registry = Self::registry(py);
-            let key = if registry.is_null() {
-                core::ptr::null_mut()
-            } else {
-                ffi::PyLong_FromSize_t(self.key())
-            };
-            if registry.is_null() || key.is_null() {
-                ffi::PyErr_Clear();
-                ffi::Py_DECREF(capsule);
-                return &*boxed; // leaked, same rationale as above
-            }
-            // Another thread of this interpreter may have won the race; keep the existing value.
-            if let Some(existing) = self.get(py) {
                 ffi::Py_DECREF(key);
-                ffi::Py_DECREF(capsule); // drops our box via the destructor
-                return existing;
+                return &*boxed; // leaked
             }
             let rc = ffi::PyDict_SetItem(registry, key, capsule);
             ffi::Py_DECREF(key);
-            ffi::Py_DECREF(capsule); // the registry holds the surviving reference
             if rc < 0 {
                 ffi::PyErr_Clear();
+                ffi::PyCapsule_SetDestructor(capsule, None); // detach: leak, do not drop
+                ffi::Py_DECREF(capsule);
+                return &*boxed; // leaked
             }
+            ffi::Py_DECREF(capsule); // the registry now holds the surviving reference
             &*boxed
         }
     }
