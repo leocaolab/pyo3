@@ -35,6 +35,9 @@ const REGISTRY_KEY: &CStr = c"_pyo3_per_interpreter";
 /// Capsule name. CPython compares this pointer-or-string when unwrapping, so it must be stable.
 const CAPSULE_NAME: &CStr = c"pyo3.per_interpreter.cell";
 
+/// Marks that this interpreter's teardown hook has been registered.
+const HOOK_KEY: &CStr = c"_pyo3_per_interpreter_hook";
+
 /// A cell holding at most one value *per interpreter*.
 ///
 /// Unlike `PyOnceLock`, a value written by one interpreter is invisible to every other
@@ -98,6 +101,7 @@ impl<T> PerInterpreterCell<T> {
             ffi::PyErr_Clear();
             return core::ptr::null_mut();
         }
+        register_teardown_hook(interp_dict);
         fresh // borrowed
     }
 
@@ -218,3 +222,106 @@ unsafe extern "C" fn destructor<T>(capsule: *mut ffi::PyObject) {
 // interpreter that owns the value, and values are never handed across interpreters.
 unsafe impl<T: Send> Send for PerInterpreterCell<T> {}
 unsafe impl<T: Send> Sync for PerInterpreterCell<T> {}
+
+
+// ---------------------------------------------------------------------------
+// Interpreter teardown
+// ---------------------------------------------------------------------------
+//
+// Dropping the capsules is not enough on its own. A heap type object is part of
+// a reference cycle — its own `__mro__` contains it — so releasing the last
+// *counted* reference still leaves it for the cyclic collector. If that never
+// runs, the type stays alive, and through `ht_module` it pins the module, the
+// module dict, and with it most of the interpreter's imported state.
+//
+// `Py_EndInterpreter` runs this interpreter's `atexit` callbacks before it tears
+// the interpreter down, and the collector is still functional at that point. So
+// the registry is dropped there and a collection is forced, rather than left to
+// whatever ordering finalization happens to use.
+
+/// Empties this interpreter's registry and collects the cycles that releases.
+unsafe extern "C" fn teardown(_self: *mut ffi::PyObject, _args: *mut ffi::PyObject) -> *mut ffi::PyObject {
+    let interp_dict = ffi::PyInterpreterState_GetDict(ffi::PyInterpreterState_Get());
+    if !interp_dict.is_null() {
+        // Dropping the sub-dict runs every capsule destructor, releasing the
+        // counted references PyO3 holds.
+        if ffi::PyDict_DelItemString(interp_dict, REGISTRY_KEY.as_ptr()) < 0 {
+            ffi::PyErr_Clear();
+        }
+        // Then break the type objects' own cycles while the collector still works.
+        let gc = ffi::PyImport_ImportModule(c"gc".as_ptr());
+        if !gc.is_null() {
+            let name = ffi::PyUnicode_FromString(c"collect".as_ptr());
+            // One pass is not enough: collecting a type object can make the objects
+            // it referenced unreachable in turn, and those are only seen next pass.
+            for _ in 0..3 {
+                let r = ffi::PyObject_CallMethodNoArgs(gc, name);
+                if r.is_null() {
+                    ffi::PyErr_Clear();
+                    break;
+                }
+                ffi::Py_DECREF(r);
+            }
+            if !name.is_null() { ffi::Py_DECREF(name); }
+            ffi::Py_DECREF(gc);
+        } else {
+            ffi::PyErr_Clear();
+        }
+    }
+    ffi::Py_INCREF(ffi::Py_None());
+    ffi::Py_None()
+}
+
+/// `PyMethodDef` is only read by CPython, so a shared static is sound.
+struct TeardownDef(ffi::PyMethodDef);
+unsafe impl Sync for TeardownDef {}
+
+static TEARDOWN_DEF: TeardownDef = TeardownDef(ffi::PyMethodDef {
+    ml_name: HOOK_KEY.as_ptr(),
+    ml_meth: ffi::PyMethodDefPointer {
+        PyCFunction: teardown,
+    },
+    ml_flags: ffi::METH_NOARGS,
+    ml_doc: core::ptr::null(),
+});
+
+/// Registers [`teardown`] with this interpreter's `atexit`, once per interpreter.
+///
+/// Failure is not fatal: without the hook the registry is simply reclaimed later
+/// (or not at all), which is the behaviour this function exists to improve on.
+unsafe fn register_teardown_hook(interp_dict: *mut ffi::PyObject) {
+    if !ffi::PyDict_GetItemString(interp_dict, HOOK_KEY.as_ptr()).is_null() {
+        return; // already registered in this interpreter
+    }
+    let atexit = ffi::PyImport_ImportModule(c"atexit".as_ptr());
+    if atexit.is_null() {
+        ffi::PyErr_Clear();
+        return;
+    }
+    let callable = ffi::PyCFunction_NewEx(
+        &TEARDOWN_DEF.0 as *const ffi::PyMethodDef as *mut ffi::PyMethodDef,
+        core::ptr::null_mut(),
+        core::ptr::null_mut(),
+    );
+    if callable.is_null() {
+        ffi::PyErr_Clear();
+        ffi::Py_DECREF(atexit);
+        return;
+    }
+    let name = ffi::PyUnicode_FromString(c"register".as_ptr());
+    let res = ffi::PyObject_CallMethodOneArg(atexit, name, callable);
+    if res.is_null() {
+        ffi::PyErr_Clear();
+    } else {
+        ffi::Py_DECREF(res);
+    }
+    if !name.is_null() {
+        ffi::Py_DECREF(name);
+    }
+    // Mark as registered so later cells skip this path.
+    if ffi::PyDict_SetItemString(interp_dict, HOOK_KEY.as_ptr(), callable) < 0 {
+        ffi::PyErr_Clear();
+    }
+    ffi::Py_DECREF(callable);
+    ffi::Py_DECREF(atexit);
+}
