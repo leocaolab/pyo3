@@ -212,9 +212,11 @@ macro_rules! create_exception_type_object {
             #[inline]
             #[allow(clippy::redundant_closure_call)]
             fn type_object_raw(py: $crate::Python<'_>) -> *mut $crate::ffi::PyTypeObject {
-                use $crate::sync::PyOnceLock;
-                static TYPE_OBJECT: PyOnceLock<$crate::Py<$crate::types::PyType>> =
-                    PyOnceLock::new();
+                use $crate::sync::PerInterpreterCell;
+                // Per-interpreter: this is a heap type, and sharing one across
+                // sub-interpreters races its refcount exactly as `#[pyclass]` types did.
+                static TYPE_OBJECT: PerInterpreterCell<$crate::Py<$crate::types::PyType>> =
+                    PerInterpreterCell::new();
 
                 TYPE_OBJECT
                     .get_or_init(py, || {
