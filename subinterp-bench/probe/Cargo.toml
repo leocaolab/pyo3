@@ -1,0 +1,19 @@
+# 独立 workspace —— 不参与 pyo3 自己的 workspace,这样它可以自由选择依赖哪个版本。
+# 默认编译的是 crates.io 上的【上游】0.29;要编 fork 版,在命令行加:
+#   cargo build --release --config 'patch.crates-io.pyo3.path="../.."'
+[workspace]
+
+[package]
+name = "abi3t"
+version = "0.0.0"
+edition = "2021"
+
+[lib]
+name = "abi3t"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.29", features = ["extension-module"] }
+
+[profile.release]
+opt-level = 3
