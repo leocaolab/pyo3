@@ -1,0 +1,344 @@
+# 子解释器隔离:调试复盘
+
+> 分支 `subinterp-per-interpreter-state` · 环境 Python 3.14.6 / macOS ARM64 / PyO3 0.29.2
+> 所有数字都是本机实测。**七个假设被数据推翻,五个结论靠测量得出** —— 比例本身是这份复盘的主要内容。
+
+---
+
+## 起点
+
+问题很小:**pyarrow 能不能在 own-GIL 子解释器里跑?** 因为一个"Rust 数据平面 + 进程内 Python UDF"的设计,需要 Python 侧能零拷贝地看到 Arrow 内存。
+
+答案是不能,而顺着"为什么不能"往下走,最后落到了 PyO3 的一个可复现的段错误上。
+
+---
+
+## 一、三堵墙,而它们不是同一堵
+
+实测 4 个 own-GIL 子解释器并发 import(override 已开):
+
+| 库 | 第 1 个 | 第 2 个 | 报错 | 性质 |
+|---|---|---|---|---|
+| pyarrow 25.0.1 | ✅ | ❌ | `Interpreter change detected` | **Cython 守卫** |
+| numpy 2.5.2 | ✅ | ❌ | `cannot load module more than once per process` | **进程级 C 全局态**(`m_size=0`) |
+| polars 1.43.2 | ✅ | ❌ | `PyO3 modules do not yet support subinterpreters` | **PyO3 的 `wrap_pymodule!`** |
+| json / 已适配的 stdlib | ✅ | ✅ | — | — |
+
+第一条的意义比 pyarrow 本身大:**`Interpreter change detected` 是 Cython 生成代码里的 `__Pyx_check_single_interpreter()`,所有 Cython 编译的扩展共享同一命运** —— pandas、scipy、sklearn、lxml 都在这一类。
+
+规模数据:pyarrow 126 MB / 21 个 `.so`,numpy 34 MB。副本方案的代价差 4 倍。
+
+### ❌ 假设 1:硬链接可以替代物理副本
+
+思路:`dlopen` 按路径去重 → 硬链接路径不同 → 独立加载;而页缓存按 inode → `.text` 共享。**磁盘 ≈ 0,内存只多 data 段。**
+
+磁盘那一半是对的(4 份硬链接 34 MB,4 份真副本 136 MB)。但:
+
+```
+硬链接   1/4 加载成功    ImportError: cannot load module more than once per process
+真副本   4/4 加载成功    ndarray 类型地址 4/4 个不同 ✅
+```
+
+**CPython/dyld 按真实路径或 inode 判定,硬链接被认成同一模块。** 假设作废。
+
+顺带一个正面发现:**真副本给的是真隔离**(4 个不同的 `ndarray` 类型地址),比后面发现的 PyO3 原生路径还干净。内存代价也比预期小:1 份 numpy 58 MB → 4 份 100 MB,每多一份只 +14 MB。
+
+---
+
+## 二、polars 为什么挂 —— 连错两次
+
+### ❌ 假设 2:polars 用的 PyO3 版本旧
+
+`strings` 二进制:**`pyo3-0.29.0`**,和已知能跑的 kernel 同版本。作废。
+
+### ❌ 假设 3:是 abi3 导致的
+
+polars 的二进制叫 `_polars_runtime.abi3.so`,而能跑的 kernel 不是 abi3。看起来很有说服力。
+
+编了两个最小模块对照,**abi3 和非 abi3 都 4/4 通过**。作废。
+
+### ❌ 方法错误:用 `strings | grep` 当判据
+
+我一直在 grep 二进制里有没有那句拒绝消息。**这个方法本身是无效的** —— 小模块里那段代码被 `-dead_strip` 剥掉了,而 polars 那个 184 MB 的没剥。**字符串在不在,和检查生不生效是两回事。**
+
+**只有实际加载才是判据。**
+
+### ✅ 真正的原因:`wrap_pymodule!`
+
+报错里的行号(`polars-python/src/c_api/mod.rs:133`)指的是运行时注册子模块,不是 import。12 行复现:
+
+```rust
+#[pymodule] fn child(m: &Bound<'_, PyModule>) -> PyResult<()> { ... }
+
+#[pymodule] fn mymod(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_wrapped(wrap_pymodule!(child))?;   // ★ 第 2 个子解释器起 panic
+    Ok(())
+}
+```
+
+```
+主解释器          ✅
+第 1 个子解释器   ✅        ← 触发条件不是"在子解释器里"
+第 2 个子解释器起 ❌ panic  ← 是"进程内第二次注册同名子模块"
+```
+
+而且 **panic 跨 FFI 会直接杀掉进程**,不是可捕获的 Python 异常。
+
+---
+
+## 三、那个守卫是不是过时了 —— 数据说不是
+
+PyO3 源码里的注释自认是权宜之计:
+
+```rust
+// Check the interpreter ID has not changed, since we currently have no way to guarantee
+// that static data is not reused across interpreters.
+// TODO: it should be possible to use the Py_mod_multiple_interpreters slot ...
+```
+
+把检查 patch 掉,跑起来**功能全对**。差点就下结论说"守卫多余"。
+
+但多测了一列:
+
+```
+8 个 own-GIL 子解释器:
+  module 地址        8/8 个不同   ✅ 隔离
+  ★ #[pyclass] 类型  1/8         ★★ 共享
+  refcount           8 → 10 → 12 → 14   (每加一个解释器 +2)
+  tp_flags           HEAPTYPE=是,IMMORTAL=否,IMMUTABLETYPE=否
+```
+
+**8 个持有独立 GIL 的解释器,在并发改同一个非不朽堆类型的引用计数。** 而且这**不是 patch 出来的** —— 未经修改的生产二进制就是这样。
+
+> **"能跑 + 结果对" ≠ "隔离了"。** 这一列不测,整个方向的结论会是反的。
+
+### 后果是可复现的崩溃
+
+```
+上游 PyO3 0.29.2:
+  8 并发 + 2000 次方法调用,无 queue         →  Abort trap: 6  (134)
+  8 并发 + queue + id(Counter) + 2000 次    →  ★ SIGSEGV (139)
+  8 并发 + queue + id,但 0 次调用           →  0   ← 不碰就不崩
+```
+
+碰得越多越容易炸 —— 和 refcount 裸奔完全吻合。
+
+### 根因在 PyO3 的架构里
+
+```rust
+pub(crate) struct GILOnceCell<T> {
+    once: Once,                        // std::sync::Once
+    data: UnsafeCell<MaybeUninit<T>>,  // 一个槽
+}
+```
+
+**没有任何解释器维度。** 而这不是疏忽:PyO3 的 `#[pyclass]` 独立于任何 module 声明,一个 type 可以加到多个 module —— **没有地方可以挂"每解释器"的状态**,只能挂 static。
+
+---
+
+## 四、修法,以及我写出的三个 bug
+
+### 方案
+
+`PerInterpreterCell<T>`:值存进 `PyInterpreterState_GetDict()` 下的一个私有子字典,用 `PyCapsule` 包住 `Box<T>`。CPython 在解释器 finalize 时清空那个字典 —— **不需要任何 teardown hook**。
+
+### 🐛 Bug 1:悬垂引用 —— 注释和代码互相矛盾
+
+```rust
+if registry.is_null() || key.is_null() {
+    ffi::Py_DECREF(capsule);   // ← 触发析构器,drop 掉 box
+    return &*boxed;            // ← ★ 返回指向已释放内存的引用
+}
+```
+
+注释写的是 `// leaked`,代码做的是 drop。**我写下了我的意图,而不是我写的东西。**
+
+**修法:所有可失败的步骤都放在创建 capsule 之前**;唯一一处 capsule 已存在时的失败,先 `PyCapsule_SetDestructor(NULL)` 再 decref,让它真的泄漏而不是被 drop。
+
+### 🐛 Bug 2:ZST 地址碰撞 —— 850 个测试全部 abort
+
+```rust
+pub struct PerInterpreterCell<T> {
+    _marker: PhantomData<fn() -> T>,   // ★ 零大小类型
+}
+```
+
+我拿 `self as *const Self as usize` 当存储 key。而 `LazyTypeObject` 里有两个 cell:
+
+```rust
+value: PerInterpreterCell<PyClassTypeObject>,
+fully_initialized_type: PerInterpreterCell<Py<PyType>>,
+```
+
+**同一个结构体里的两个 ZST 字段可以有相同的地址。** 两个 cell 用同一个 key,互相覆盖,读出来类型混淆 → 空指针 → `NonNull::new_unchecked` → 非展开 panic → SIGABRT。
+
+**怎么发现的:** 猜不出来。插桩打印 key,发现**只出现一个 key**,而应该有两个。
+
+**修法:** 加一个 `AtomicU8` 字段,让每个 cell 有独立地址(顺便防止链接器合并相同的 static)。
+
+### 🐛 Bug 3:内存 0% 回收 —— 排除了五个假设才找到
+
+```
+16 个解释器:上游回收 48.0%,我的 fork 回收 0.0%
+800 个解释器:RSS 涨 2.5 GB,线性不收敛
+```
+
+#### ❌ 测量错误:用了 `ru_maxrss`
+
+那是**峰值** RSS,单调不减 —— 它必然增长,测不出释放。换成 `ps -o rss=` 的当前 RSS。
+
+(换完之后数字几乎一样,泄漏是真的。但方法错了就是错了。)
+
+#### ❌ 假设 4:capsule 析构器没跑
+
+插桩:3 轮 × 2 解释器 = **12 次触发**,正好是 6 个解释器 × 2 个 cell。一次不少。
+
+#### ❌ 假设 5:析构时没有正确的 GIL
+
+插桩:`gil=1`、`tstate` 非空、`drop 完成`。释放是真的发生了。
+
+#### ❌ 假设 6:是 `create_type_object` 里那三处故意泄漏
+
+```rust
+create_type_object.rs:173   Box::into_raw(data.into_boxed_slice())
+create_type_object.rs:195   def.into_raw()
+create_type_object.rs:556   core::mem::forget(class_name);
+```
+
+看起来很对 —— PyO3 的前提就是"一个进程建一次 type,活到进程结束,泄漏无所谓",而我打破了这个前提。
+
+**测:1 个类 vs 11 个类。58.5 MB → 59.5 MB。** 10 个额外的类只多 1 MB,每类 6 KB —— 和要解释的 1.76 MB **差 30 倍**。作废。
+
+#### ❌ 假设 7:malloc 碎片化,不是真泄漏
+
+串行 100 轮(建 8 个 → 全关 → 再建 8 个),内存应该能复用。**实测线性涨到 2.5 GB 不收敛 → 是真泄漏。** 作废。
+
+#### ✅ 真正的原因:堆类型是循环垃圾
+
+```
+每个 type 的 refcount = 5
+  能核销 3 个:module dict 1 + value cell 1 + fully_initialized_type cell 1
+  ★ 剩下 2 个核销不掉 —— type 对象的 __mro__ 里含它自己
+```
+
+**释放最后一个计数引用之后,它还留给循环收集器。** 而如果收集器没跑到,type 就不死;它通过 `ht_module` 持有 module,module 持有 module dict,**整个解释器的 import 状态被钉住 —— 每个 1.76 MB。**
+
+上游一个进程只建一次 type、泄漏一次,看不见。我改成每解释器一次,泄漏就乘以解释器数。
+
+**修法:** 给每个解释器的 `atexit` 注册一个回调 —— `Py_EndInterpreter` 会在拆解之前调用它,而那时收集器还活着。回调清空 registry,然后 `gc.collect()`。
+
+**一轮不够:**
+
+```
+1 轮 GC   →  回收 25.2%
+3 轮 GC   →  回收 48.0%   (上游 48.1%)
+```
+
+**收掉一个 type 会让它引用的东西变成不可达,那要下一轮才看得见。**
+
+---
+
+## 五、"为什么不改剩下的 141 处"
+
+这个问题问出了第四个 bug。
+
+我的答案本来是:**只修量到坏的那一处**。141 处 `PyOnceLock` 里很多存的是 `bool` / 版本号 / 配置,而 165 处 `intern!` 存的驻留字符串在 3.12+ 多数是不朽的(不朽 = refcount 饱和 = 无竞争)。
+
+**但"我以为安全"刚被证明是不可靠的。** 去测了异常类型:
+
+```rust
+// create_exception! 宏里内联的
+static TYPE_OBJECT: PyOnceLock<Py<PyType>> = PyOnceLock::new();
+```
+
+```
+#[pyclass] Counter   4/4 个不同   ✅ 已修
+异常类型 MyError     1/4 个不同   ★★ 仍共享
+```
+
+**同一个失效形状,藏在宏里,另一条缓存路径。** 改一行修好,8/8。
+
+然后把剩下的 79 处 cache site 静态分类,并对最大的一类(42 处 `src/types/` 下缓存 CPython 内建类型)做了运行时判定:
+
+```
+list / float / int / range / memoryview / super / code
+  → 4 个子解释器里全部共享同一地址,【全部不朽】
+  → refcount 饱和,不存在竞争 → ✅ 无需修改
+```
+
+### 判据(可执行)
+
+```
+持有 PyObject 吗?   否 → 安全(bool / 版本号 / 配置)
+是不朽对象吗?       是 → 安全(CPython 静态类型、3.12+ 驻留字符串)
+是堆类型吗?         是 → ★ 危险 —— 只有这一类要改
+```
+
+已知的堆类型缓存有两处(`#[pyclass]`、`create_exception!`),都改完了。
+
+---
+
+## 六、性能:方向对,实现有回归
+
+PyO3 自带的 `bench_pyclass`,同机背靠背:
+
+| | 上游 | fork | 变化 |
+|---|---|---|---|
+| `pyclass_create` | 25.87 ns | 71.25 ns | **慢 2.75×** |
+| `bench_call` | 53.70 ns | 52.70 ns | 持平 |
+| `bench_fast` | 40.42 ns | 32.46 ns | 略快(方差内) |
+
+**每创建一个实例多付 45 ns。** 而根因又是实现偷懒,不是设计的固有代价:
+
+```rust
+let key = ffi::PyLong_FromSize_t(self.key());   // ★ 每次查找都堆分配一个 Python 整数
+let capsule = ffi::PyDict_GetItem(registry, key);
+```
+
+**每次 `get()` 分配一个 `PyLong`,再做两次 dict 哈希查找。**
+
+改法(未实施):registry 从 dict 换成 **PyList**,每个 cell 首次使用时从一个进程级计数器领一个下标 → 查找变成 `PyList_GET_ITEM(registry, idx)`,指针偏移,零分配。再叠一个小的内联槽数组 `[(AtomicI64, AtomicPtr<T>); 8]` 做快路径。
+
+---
+
+## 七、当前状态
+
+| | 上游 PyO3 0.29.2 | 本分支 |
+|---|---|---|
+| `#[pyclass]` 类型(8 个解释器) | 1 个,共享 | **8 个,独立** |
+| 异常类型(8 个解释器) | 1 个,共享 | **8 个,独立** |
+| 并发压测(8 × 2000 次调用) | **SIGSEGV** | 正常 |
+| 内存回收(16 个解释器) | 48.0% | **51.1%** |
+| 长跑(4000 个解释器) | — | +24.8 MB,斜率 +3.4 MB/千轮,收敛 |
+| 上游测试套件 | 850 passed | **850 passed, 0 failed** |
+| `pyclass_create` | 25.87 ns | **71.25 ns ⚠️** |
+
+### 还没做
+
+- 性能回归(方案已定,未实施)
+- `wrap_pymodule!` 的守卫仍在 —— 子模块仍拒绝子解释器
+- 仍需 `_override_multi_interp_extensions_check(-1)`,因为没声明 `Py_MOD_PER_INTERPRETER_GIL_SUPPORTED`
+- 只在 macOS ARM64 验证过
+- 剩余 79 处 cache site 里,`Py<PyAny>` / `Py<PyTzInfo>` / `Py<PyModule>` 等约 20 处未做运行时判定
+
+### 和这个修复无关的
+
+numpy / pandas / scipy / pyarrow 仍然需要物理副本 —— 那是 Cython 守卫和进程级 C 全局态,不在 PyO3 这一层。
+
+---
+
+## 八、方法上的教训
+
+1. **"能跑 + 结果对" ≠ "隔离了"。** 功能测试全绿的同时,8 个解释器在共享一个 type 对象。**测对象身份(地址、refcount、tp_flags),不要只测输出。**
+
+2. **grep 二进制不是测试,加载才是。** `-dead_strip` 会让小模块里的字符串消失,大模块里留着 —— 字符串的有无和行为无关。
+
+3. **`ru_maxrss` 是峰值,不是当前值。** 它单调不减,测不出释放。
+
+4. **对照组要和被测组同构。** 我第一次比较时对照用的是旧的 `.so`(没有 `Counter`),那一行数据是废的。
+
+5. **注释写的是意图,代码写的是行为。** Bug 1 里两者矛盾,而我读了很多遍都没看出来 —— 因为我读的是注释。
+
+6. **读代码形成的假设,七个错了七个;测量得出的结论,五个对了五个。** 这不是运气,是这类问题的性质:进程级状态、生命周期、引用计数,都不在源码的字面里。
+
+7. **"我以为它安全"是最贵的一句话。** 异常类型那个 bug,是被"为什么不改剩下的"这个问题逼出来的 —— 如果没人问,它会一直在那。
