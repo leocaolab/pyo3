@@ -374,6 +374,36 @@ pub(crate) fn is_in_gc_traversal() -> bool {
         .unwrap_or(false)
 }
 
+/// Marks the thread as attached for the duration of a callback that CPython makes into Rust
+/// *without* going through PyO3 — a capsule destructor, or an `atexit` hook installed as a raw
+/// `PyMethodDef`.
+///
+/// Such a callback runs with a thread state current, but PyO3 never saw the transition, so
+/// [`thread_is_attached`] reports `false` and every `Py<T>` dropped inside it defers its decref
+/// into the process-wide reference pool instead of applying it.
+///
+/// Unlike [`AttachGuard::assume`] this deliberately does **not** flush that pool. It is used while
+/// a *sub*-interpreter is finalizing, and the pool holds references belonging to whichever
+/// interpreter queued them; releasing those from here would decrement refcounts in a different
+/// interpreter's heap.
+pub(crate) struct AssumeAttached(());
+
+impl AssumeAttached {
+    /// # Safety
+    ///
+    /// A thread state must be current for the whole lifetime of the returned guard.
+    pub(crate) unsafe fn new() -> Self {
+        increment_attach_count();
+        AssumeAttached(())
+    }
+}
+
+impl Drop for AssumeAttached {
+    fn drop(&mut self) {
+        decrement_attach_count();
+    }
+}
+
 /// Increments pyo3's internal attach count - to be called whenever an AttachGuard is created.
 #[inline(always)]
 fn increment_attach_count() {
