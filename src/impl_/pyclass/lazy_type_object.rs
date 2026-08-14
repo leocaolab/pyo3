@@ -7,8 +7,6 @@ use std::thread::{self, ThreadId};
 
 #[cfg(Py_3_14)]
 use crate::err::error_on_minusone;
-#[allow(deprecated)]
-use crate::sync::GILOnceCell;
 use crate::sync::PerInterpreterCell;
 #[cfg(Py_3_14)]
 use crate::types::PyTypeMethods;
