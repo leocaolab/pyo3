@@ -9,6 +9,7 @@ use std::thread::{self, ThreadId};
 use crate::err::error_on_minusone;
 #[allow(deprecated)]
 use crate::sync::GILOnceCell;
+use crate::sync::PerInterpreterCell;
 #[cfg(Py_3_14)]
 use crate::types::PyTypeMethods;
 use crate::{
@@ -30,13 +31,11 @@ pub struct LazyTypeObject<T>(LazyTypeObjectInner, PhantomData<T>);
 
 // Non-generic inner of LazyTypeObject to keep code size down
 struct LazyTypeObjectInner {
-    #[allow(deprecated)]
-    value: GILOnceCell<PyClassTypeObject>,
+    value: PerInterpreterCell<PyClassTypeObject>,
     // Threads which have begun initialization of the `tp_dict`. Used for
     // reentrant initialization detection.
     initializing_threads: Mutex<Vec<ThreadId>>,
-    #[allow(deprecated)]
-    fully_initialized_type: GILOnceCell<Py<PyType>>,
+    fully_initialized_type: PerInterpreterCell<Py<PyType>>,
 }
 
 impl<T> LazyTypeObject<T> {
@@ -45,11 +44,9 @@ impl<T> LazyTypeObject<T> {
     pub const fn new() -> Self {
         LazyTypeObject(
             LazyTypeObjectInner {
-                #[allow(deprecated)]
-                value: GILOnceCell::new(),
+                value: PerInterpreterCell::new(),
                 initializing_threads: Mutex::new(Vec::new()),
-                #[allow(deprecated)]
-                fully_initialized_type: GILOnceCell::new(),
+                fully_initialized_type: PerInterpreterCell::new(),
             },
             PhantomData,
         )

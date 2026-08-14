@@ -21,6 +21,10 @@ use crate::{
 use core::{cell::UnsafeCell, marker::PhantomData, mem::MaybeUninit};
 use std::sync::{Once, OnceState};
 
+mod per_interpreter;
+pub use per_interpreter::PerInterpreterCell;
+
+
 pub mod critical_section;
 pub(crate) mod once_lock;
 
