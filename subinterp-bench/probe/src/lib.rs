@@ -73,7 +73,40 @@ fn type_lookup_ns(n: u64, py: Python<'_>) -> f64 {
     ns
 }
 
+// ── 裸 C ABI 对照 ──────────────────────────────────────────────────────
+// 和 noop() 做同样的事(什么都不做,返回 None),但完全绕开 PyO3 的调用包装:
+// 没有 catch_unwind,没有 attach 记账,没有参数/返回值转换。
+// 两者的差 = PyO3 每次调用的全部固定成本。
+
+unsafe extern "C" fn raw_noop_impl(
+    _slf: *mut pyo3::ffi::PyObject,
+    _args: *mut pyo3::ffi::PyObject,
+) -> *mut pyo3::ffi::PyObject {
+    // Py_None 在 3.12+ 是永生对象,这个 INCREF 不写内存
+    pyo3::ffi::Py_INCREF(pyo3::ffi::Py_None());
+    pyo3::ffi::Py_None()
+}
+
+/// `PyMethodDef` 只被 CPython 读,共享一个 static 是安全的。
+struct RawDef(pyo3::ffi::PyMethodDef);
+unsafe impl Sync for RawDef {}
+static RAW_NOOP: RawDef = RawDef(pyo3::ffi::PyMethodDef {
+    ml_name: c"raw_noop".as_ptr(),
+    ml_meth: pyo3::ffi::PyMethodDefPointer { PyCFunction: raw_noop_impl },
+    ml_flags: pyo3::ffi::METH_NOARGS,
+    ml_doc: core::ptr::null(),
+});
+
 #[pymodule] fn abi3t(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    unsafe {
+        let f = pyo3::ffi::PyCFunction_NewEx(
+            &RAW_NOOP.0 as *const _ as *mut _,
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+        );
+        if f.is_null() { return Err(PyErr::fetch(m.py())); }
+        m.add("raw_noop", Bound::from_owned_ptr(m.py(), f))?;
+    }
     m.add_function(wrap_pyfunction!(interp_id_ns, m)?)?;
     m.add_function(wrap_pyfunction!(type_lookup_ns, m)?)?;
     m.add_function(wrap_pyfunction!(noop, m)?)?;

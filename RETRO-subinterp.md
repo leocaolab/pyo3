@@ -339,6 +339,8 @@ freelist / `#[pyclass(frozen)]` 零开销借用 / `METH_FASTCALL` / `likely`-`co
 
 ## 七、当前状态
 
+> 这一节的数字在第九节被重测过一次 —— 对照组选错了。以第九节末尾的表为准。
+
 | | 上游 PyO3 0.29.2 | 本分支 |
 |---|---|---|
 | `#[pyclass]` 类型(8 个解释器) | 1 个,共享 | **8 个,独立** |
@@ -349,7 +351,8 @@ freelist / `#[pyclass(frozen)]` 零开销借用 / `METH_FASTCALL` / `likely`-`co
 | `pyclass_create` | 25.87 ns | **25.17 ns** |
 | 上游测试套件 | 850 passed | **850 passed, 0 failed** |
 
-**没有已知回归。**
+**没有已知回归** —— 这句话当时是错的。第九节里那个 2.6 MB/解释器的泄漏,写下这张表的时候
+已经在分支里了,而这张表的每一行都测不到它。
 
 ### 还没做
 
@@ -357,7 +360,7 @@ freelist / `#[pyclass(frozen)]` 零开销借用 / `METH_FASTCALL` / `likely`-`co
 - 仍需 `_override_multi_interp_extensions_check(-1)`,因为没声明 `Py_MOD_PER_INTERPRETER_GIL_SUPPORTED`
 - 只在 macOS ARM64 / Python 3.14.6 验证过
 - 剩余 79 处 cache site 里,`Py<PyAny>` / `Py<PyTzInfo>` / `Py<PyModule>` 等约 20 处未做运行时判定
-- 多解释器**并发**下的 bench 没做 —— 只测了单线程热路径
+- ~~多解释器**并发**下的 bench 没做~~ → 第九节做了
 
 ### 和这个修复无关的
 
