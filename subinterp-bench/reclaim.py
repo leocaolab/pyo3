@@ -85,5 +85,5 @@ for case, (label, _) in CASES.items():
     print(f"  {label:28} " + " ".join(cells))
 
 print("=" * W)
-print("  没有 pyclass 实例活到关闭时,fork 收不回来 —— 见 README 第 4 节。")
+print("  每行都该和「不 import 扩展」那行持平。修复前,除了「实例活到关闭」以外全是 0%。")
 print("=" * W)

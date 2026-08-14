@@ -27,7 +27,29 @@ warnings.filterwarnings("ignore")
 SECS = 1.0
 WORKERS = 12
 HERE = os.path.dirname(os.path.abspath(__file__))
-FT_PYTHON = os.environ.get("FT_PYTHON", "/opt/homebrew/bin/python3.14t")
+FT_SO = os.environ.get("FT_SO", "/tmp/ft_base")
+
+
+def find_ft_python():
+    """找一个免 GIL 解释器:先看 FT_PYTHON,再扫 PATH,最后问 uv。"""
+    if "FT_PYTHON" in os.environ:
+        return os.environ["FT_PYTHON"]
+    import glob
+    import shutil
+
+    for d in os.environ.get("PATH", "").split(os.pathsep):
+        for p in sorted(glob.glob(os.path.join(d, "python3.[0-9]*t"))):
+            if os.access(p, os.X_OK):
+                return p
+    if shutil.which("uv"):
+        r = subprocess.run(["uv", "python", "find", "3.14t"],
+                           capture_output=True, text=True)
+        if r.returncode == 0 and r.stdout.strip():
+            return r.stdout.strip()
+    return ""
+
+
+FT_PYTHON = find_ft_python()
 
 # (标签, 表达式) —— 表达式在两种 harness 里都得能求值
 CASES = [
@@ -182,6 +204,8 @@ def cell(python, kind, so_dir, stmt, n):
 
 # ── 主表 ──────────────────────────────────────────────────────────
 def have_ft():
+    if not FT_PYTHON:
+        return "PATH 和 uv 里都没有免 GIL 解释器(python3.1Xt)"
     if not os.path.exists(FT_PYTHON):
         return f"未找到 {FT_PYTHON}"
     r = subprocess.run([FT_PYTHON, "-c",
@@ -189,15 +213,15 @@ def have_ft():
                        capture_output=True, text=True)
     if r.stdout.strip() != "1":
         return f"{FT_PYTHON} 不是免 GIL build"
-    if not os.path.exists("/tmp/ft_base/abi3t.so"):
-        return "缺 /tmp/ft_base/abi3t.so(需用 PYO3_PYTHON=<免GIL解释器> 另编一份)"
+    if not os.path.exists(f"{FT_SO}/abi3t.so"):
+        return f"缺 {FT_SO}/abi3t.so(需用 PYO3_PYTHON=<免GIL解释器> 另编一份)"
     return None
 
 
 ft_err = have_ft()
 COLS = [
     ("MT (GIL)",  sys.executable, "threads", f"{HERE}/so_base"),
-    ("free-thr",  FT_PYTHON,      "threads", "/tmp/ft_base"),
+    ("free-thr",  FT_PYTHON,      "threads", FT_SO),
     ("MI 对照",    sys.executable, "interps", f"{HERE}/so_base"),
     ("MI 本分支",  sys.executable, "interps", f"{HERE}/so_fork"),
 ]
