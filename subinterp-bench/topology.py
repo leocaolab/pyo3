@@ -53,20 +53,33 @@ def bench_threads(so_dir, stmt, n):
     """N 个 OS 线程共享一个解释器。返回总吞吐(次/秒)。"""
     sys.path.insert(0, so_dir)
     import abi3t  # noqa: F401
-    ns = {"abi3t": abi3t}
+
+    # ── 这个 harness 的两条硬约束,都是被量出来的 ──────────────────────
+    #
+    # 免 GIL 下,任何"每次访问都要 incref 一个共享对象"的名字查找都会让 12 个
+    # 线程抢同一条缓存行,于是 harness 自己变成瓶颈。同一个纯 Python 负载:
+    #
+    #   闭包变量 (LOAD_DEREF,12 线程共用一个 cell)    n=12   8.9 M/s   0.44×
+    #   模块全局 (LOAD_GLOBAL,有专门优化路径)         n=12 141.3 M/s   6.78×
+    #
+    # 单线程两者都是 20.6 M/s —— 差别只在多线程,而且是 16 倍。所以:
+    #   ① 被测表达式和循环体都必须 exec 进【真正的模块全局】,不能用新建的 dict;
+    #   ② worker 函数本身也得在那里定义,否则它对 fn 的引用又变回闭包 cell。
+    ns = globals()
+    ns["abi3t"] = abi3t
     exec(PRELUDE, ns)
-    fn = eval(f"lambda: {stmt}", ns)
-
-    stop = [False]
-    counts = [0] * n
-
-    def work(i):
-        k = 0
-        while not stop[0]:
-            for _ in range(200):
-                fn()
-            k += 200
-        counts[i] = k
+    ns["_stop"] = [False]
+    ns["_counts"] = [0] * n
+    exec(f"""
+def _worker(i):
+    k = 0
+    while not _stop[0]:
+        for _ in range(200):
+            {stmt}
+        k += 200
+    _counts[i] = k
+""", ns)
+    work, stop, counts = ns["_worker"], ns["_stop"], ns["_counts"]
 
     ts = [threading.Thread(target=work, args=(i,)) for i in range(n)]
     t0 = time.perf_counter()
@@ -138,20 +151,33 @@ def bench_interps(so_dir, stmt, n):
     return sum(got) / el
 
 
-# ── 子进程入口:免 GIL 那一列得换解释器跑 ──────────────────────────
-if len(sys.argv) == 4 and sys.argv[1] == "--threads":
-    print(bench_threads(sys.argv[2], sys.argv[3], WORKERS))
-    print(bench_threads(sys.argv[2], sys.argv[3], 1))
+# ── 每个单元格独占一个子进程 ──────────────────────────────────────
+#
+# 必须这样。`MI 对照` 跑 Row(...) 会 SIGSEGV —— 那正是这个分支要修的东西。
+# 跑在主进程里,它会把整张表一起带走;而且崩溃本身是结果,不该被吞掉。
+
+RUNNERS = {
+    "threads": bench_threads,
+    "interps": bench_interps,
+}
+
+if len(sys.argv) == 5 and sys.argv[1] in RUNNERS:
+    _kind, _so, _stmt = sys.argv[1], sys.argv[2], sys.argv[3]
+    print(RUNNERS[_kind](_so, _stmt, int(sys.argv[4])))
     raise SystemExit
 
 
-def ft_column(stmt):
-    r = subprocess.run([FT_PYTHON, __file__, "--threads", "/tmp/ft_base", stmt],
+def cell(python, kind, so_dir, stmt, n):
+    """返回吞吐。子进程被信号打死时抛出带信号名的异常。"""
+    r = subprocess.run([python, __file__, kind, so_dir, stmt, str(n)],
                        capture_output=True, text=True)
+    if r.returncode < 0:
+        import signal
+        raise RuntimeError(f"崩溃 {signal.Signals(-r.returncode).name}")
     if r.returncode != 0:
-        raise RuntimeError(r.stderr.strip().splitlines()[-1][:80])
-    many, one = (float(x) for x in r.stdout.split())
-    return many, one
+        tail = (r.stderr.strip().splitlines() or ["无 stderr"])[-1]
+        raise RuntimeError(tail[:60])
+    return float(r.stdout.strip())
 
 
 # ── 主表 ──────────────────────────────────────────────────────────
@@ -168,43 +194,42 @@ def have_ft():
     return None
 
 
+ft_err = have_ft()
 COLS = [
-    ("MT (GIL)",   lambda s, n: bench_threads(f"{HERE}/so_base", s, n)),
-    ("free-thr",   None),                                    # 走子进程
-    ("MI 对照",     lambda s, n: bench_interps(f"{HERE}/so_base", s, n)),
-    ("MI 本分支",   lambda s, n: bench_interps(f"{HERE}/so_fork", s, n)),
+    ("MT (GIL)",  sys.executable, "threads", f"{HERE}/so_base"),
+    ("free-thr",  FT_PYTHON,      "threads", "/tmp/ft_base"),
+    ("MI 对照",    sys.executable, "interps", f"{HERE}/so_base"),
+    ("MI 本分支",  sys.executable, "interps", f"{HERE}/so_fork"),
 ]
 
-W = 92
-ft_err = have_ft()
+W = 96
 print("=" * W)
-print(f"并行拓扑对比   {WORKERS} worker / 每点 {SECS}s   Python {sys.version.split()[0]}")
+print(f"并行拓扑对比   {WORKERS} worker / 每点 {SECS}s   Python {sys.version.split()[0]}   "
+      f"{os.cpu_count()} 逻辑核")
 print("=" * W)
 if ft_err:
     print(f"  free-thr 列跳过:{ft_err}\n")
-print(f"  {'负载':32}" + "".join(f"{c:>13}" for c, _ in COLS) + f"{'单线程':>12}")
+print(f"  {'负载':32}" + "".join(f"{c:>14}" for c, *_ in COLS) + f"{'单 worker':>12}")
 print("  " + "-" * (W - 4))
 
 for label, stmt in CASES:
     cells, base_rate = [], None
-    for name, fn in COLS:
+    for name, py, kind, so in COLS:
+        if name == "free-thr" and ft_err:
+            cells.append("—")
+            continue
         try:
-            if fn is None:
-                if ft_err:
-                    cells.append("—")
-                    continue
-                many, one = ft_column(stmt)
-            else:
-                many, one = fn(stmt, WORKERS), fn(stmt, 1)
+            many = cell(py, kind, so, stmt, WORKERS)
+            one = cell(py, kind, so, stmt, 1)
             if base_rate is None:
                 base_rate = one
             cells.append(f"{many / one:.2f}×")
         except Exception as e:
-            # 失败要带出真实原因,不要一个哨兵词
-            cells.append(f"失败({type(e).__name__})")
+            cells.append(str(e)[:13])          # 崩溃/报错原样带出,不用哨兵词
     rate = f"{base_rate / 1e6:.1f}M/s" if base_rate else "—"
-    print(f"  {label:32}" + "".join(f"{c:>13}" for c in cells) + f"{rate:>12}")
+    print(f"  {label:32}" + "".join(f"{c:>14}" for c in cells) + f"{rate:>12}")
 
 print("=" * W)
-print("  倍数 = 该拓扑下 12 worker 吞吐 ÷ 同拓扑 1 worker 吞吐。单线程列取第一个成功的拓扑。")
+print("  倍数 = 该拓扑下 12 worker 吞吐 ÷ 同拓扑 1 worker 吞吐;单 worker 列取第一个成功的拓扑。")
+print("  每个单元格独占一个子进程 —— MI 对照跑建对象时会 SIGSEGV,那是结果的一部分。")
 print("=" * W)
