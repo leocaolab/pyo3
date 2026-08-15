@@ -358,7 +358,9 @@ unsafe extern "C" fn teardown(
         if !gc.is_null() {
             let name = ffi::PyUnicode_FromString(c"collect".as_ptr());
             for _ in 0..3 {
-                let r = ffi::PyObject_CallMethodNoArgs(gc, name);
+                // `PyObject_CallMethodNoArgs` 不在限定 API 里(polars 这类 abi3 构建会编不过),
+                // `PyObject_CallMethodObjArgs` 在。它是变参,以 NULL 结尾。
+                let r = ffi::PyObject_CallMethodObjArgs(gc, name, core::ptr::null_mut::<ffi::PyObject>());
                 if r.is_null() {
                     ffi::PyErr_Clear();
                     break;
@@ -414,7 +416,13 @@ unsafe fn register_teardown_hook(interp_dict: *mut ffi::PyObject) {
         return;
     }
     let name = ffi::PyUnicode_FromString(c"register".as_ptr());
-    let res = ffi::PyObject_CallMethodOneArg(atexit, name, callable);
+    // 同上:`PyObject_CallMethodOneArg` 不在限定 API 里。
+    let res = ffi::PyObject_CallMethodObjArgs(
+        atexit,
+        name,
+        callable,
+        core::ptr::null_mut::<ffi::PyObject>(),
+    );
     if res.is_null() {
         ffi::PyErr_Clear();
     } else {
