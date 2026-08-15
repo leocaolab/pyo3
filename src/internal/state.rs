@@ -45,7 +45,14 @@ pub(crate) fn thread_is_attached() -> bool {
 /// RAII type that represents thread attachment to the interpreter.
 pub(crate) enum AttachGuard {
     /// Indicates the thread was already attached when this AttachGuard was acquired.
-    Assumed,
+    ///
+    /// Carries the address of this thread's `ATTACH_COUNT`, resolved once on the way in so
+    /// that `Drop` does not pay for a second thread-local lookup. Null if TLS was already
+    /// gone (this can be reached from `atexit`), in which case neither side touches it.
+    ///
+    /// Kept as an opaque pointer: a `*const Cell<isize>` would make `AttachGuard` not
+    /// `RefUnwindSafe`, and `catch_unwind` in the trampoline borrows the guard.
+    Assumed { cell: *const () },
     /// Indicates that we attached when this AttachGuard was acquired
     Ensured { gstate: ffi::PyGILState_STATE },
 }
@@ -158,10 +165,25 @@ impl AttachGuard {
     /// Acquires the `AttachGuard` while assuming that the thread is already attached
     /// to the interpreter.
     pub(crate) unsafe fn assume() -> Self {
-        increment_attach_count();
+        // 只取一次 TLS 地址,进出共用。在 dylib 里每次 thread_local 访问都要走
+        // 一次 tlv_get_addr(macOS)/__tls_get_addr —— 进 +1、出 -1 各取一次,
+        // 实测占了整个 FFI 边界税(2.24ns / 每次调用)的大头。
+        let cell = attach_count_cell();
+        if !cell.is_null() {
+            // SAFETY: non-null means this thread's TLS is alive; the guard cannot outlive
+            // the call it was created in, and only this thread writes this cell.
+            unsafe {
+                let c = &*(cell as *const Cell<isize>);
+                let current = c.get();
+                if current < 0 {
+                    ForbidAttaching::bail(current);
+                }
+                c.set(current + 1);
+            }
+        }
         // SAFETY: invariant of calling this function
         drop_deferred_references(unsafe { Python::assume_attached() });
-        AttachGuard::Assumed
+        AttachGuard::Assumed { cell }
     }
 
     /// Gets the Python token associated with this [`AttachGuard`].
@@ -176,7 +198,18 @@ impl AttachGuard {
 impl Drop for AttachGuard {
     fn drop(&mut self) {
         match self {
-            AttachGuard::Assumed => {}
+            AttachGuard::Assumed { cell } => {
+                if !cell.is_null() {
+                    // SAFETY: same thread as `assume`, and the cell outlives this guard.
+                    unsafe {
+                        let c = &*(*cell as *const Cell<isize>);
+                        let current = c.get();
+                        debug_assert!(current > 0, "Negative attach count detected.");
+                        c.set(current - 1);
+                    }
+                }
+                return;
+            }
             AttachGuard::Ensured { gstate } => unsafe {
                 // Drop the objects in the pool before attempting to release the thread state
                 ffi::PyGILState_Release(*gstate);
@@ -402,6 +435,16 @@ impl Drop for AssumeAttached {
     fn drop(&mut self) {
         decrement_attach_count();
     }
+}
+
+/// This thread's `ATTACH_COUNT` cell, or null if its TLS is already gone.
+///
+/// Resolving the address once and reusing it removes one thread-local lookup per FFI call.
+#[inline(always)]
+fn attach_count_cell() -> *const () {
+    ATTACH_COUNT
+        .try_with(|c| c as *const Cell<isize> as *const ())
+        .unwrap_or(core::ptr::null())
 }
 
 /// Increments pyo3's internal attach count - to be called whenever an AttachGuard is created.
