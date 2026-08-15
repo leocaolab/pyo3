@@ -5,14 +5,33 @@
 > 对照 = 本分支的父提交 `dfdbc46`(PyO3 main),不是 crates.io 发行版
 > 相关:[`JOURNAL.md`](../JOURNAL.md) · [`METHOD.md`](METHOD.md)
 
+## ⚠️ 先读这一段
+
+**这份文档下面的结论,是在没有打到几种关键形状的负载上得到的。** 后来的压测
+(见[压测:四个新问题](#压测四个新问题))在 **1–4 秒内**就把 8 个子解释器的进程打死了。
+
+现在诚实的说法是:
+
+```
+✅ 能加载、能隔离、单解释器下功能正确、稳态不泄漏
+★ 多解释器 + 高频写出   1–4 秒内 SIGABRT(pyo3 的全局延迟释放池跨解释器 free)
+★ 多解释器 + map_elements  50% 概率静默拿到【别的解释器的类对象】,给出错误结果
+★ 每个子解释器生命周期泄漏 ~60KB,且 import 慢 3.7 倍
+```
+
+**它现在不能上生产。** 下面的数字仍然有效 —— 它们量的是"能不能进去、隔不隔离、
+扩不扩展",那部分是真的;但"能用"这个结论下得太早了。
+
+---
+
 ## 一句话
 
 **上游 PyO3 上,polars 进不了子解释器 —— 开了 `_override` 开关也只进得去 1 个。**
-本分支之后,4 个 own-GIL 子解释器**不需要任何进程级开关**就能各自跑完整的 polars,
+本分支之后,4 个 own-GIL 子解释器**不需要任何进程级开关**就能各自加载完整的 polars,
 类型对象各自独立,内存比"每 worker 一份物理副本"的路线少 35%,冷启动快 80 倍。
 
-代价:**只对你自己从源码编译的扩展有效。** pip 装的 wheel 是拿上游 PyO3 编的,
-`[patch.crates-io]` 管不到。
+代价有两层:**只对你自己从源码编译的扩展有效**(pip 装的 wheel 是拿上游 PyO3 编的,
+`[patch.crates-io]` 管不到),**以及上面那四个还没解决的问题**。
 
 ---
 
@@ -297,3 +316,120 @@ polars 是第一个真实消费者,而它当场逼出三个**本仓库基准一�
 `matrix.py` 跑能力矩阵 —— polars 的每个症状现在几秒复现,不用等 7 分钟的构建。
 
 **教训写在 [`METHOD.md`](METHOD.md):行为维度测得再密,补不上构建维度的零覆盖。**
+
+
+---
+
+## 压测:四个新问题
+
+345,600 次写、113 万次操作、跨 4/8/12 个子解释器,全程不开 `PYTHONMALLOC=malloc`。
+每个可能崩的用例独占子进程,被信号打死时报信号名。
+
+**先说好的部分,因为它是真的:**
+
+```
+并发正确性   9/9 通过,345,600 次写
+             写发生在错误解释器 0 次
+             与"纯 Rust 直写文件"的解析解逐字节比对,不一致 0 次
+             读回校验和不一致 0 次
+稳态内存     8 个解释器持续跑 120 秒,113 万次操作,零错误
+             RSS 每千次操作 −0.010 MB(整体)/ −0.033(后半)—— 平,甚至微降
+```
+
+**然后是四个问题。**
+
+### ★ A. pyo3 的全局延迟释放池跨解释器 free —— 运行中崩
+
+不销毁任何解释器、干完直接 `os._exit(0)` 跳过 finalize,所以崩的一定是**运行期**:
+
+```
+write N=8   6/6 崩,用时 1.0 / 1.0 / 1.2 / 1.5 / 2.7 / 4.1 秒
+N=1         0/3 崩(16,446+ 次 collect 全对)   ← 证实是跨解释器,不是单纯 UAF
+```
+
+栈每次都一样:
+
+```
+ReferencePool::drop_deferred_references_slow
+  → subtype_dealloc → _PyObject_Free
+  → ___BUG_IN_CLIENT_OF_LIBMALLOC_POINTER_BEING_FREED_WAS_NOT_ALLOCATED
+```
+
+根因在 `src/internal/state.rs`:
+
+```rust
+static POOL: OnceLock<ReferencePool> = OnceLock::new();     // ★ 进程级
+```
+
+`register_decref` 把"detach 状态下 drop 的对象"**不分解释器**塞进同一个 `Vec`;
+`drop_deferred_references` 随后在**当前恰好附着的那个解释器**上对池里所有对象
+`Py_DECREF`。解释器 A 的对象被解释器 B free 掉,指针不在 B 的 arena 里 → abort。
+同时这还是一次对 A 的对象的**无同步 refcount 修改**,而 A 正拿着自己的 GIL 在跑。
+
+**这个分支把 `#[pyclass]` 类型对象、异常类型、模块对象、以及 file-like 回调都做成了
+每解释器一份,唯独这个池没有。** 而 `AssumeAttached` 的注释里写过这个危险 ——
+识别了陷阱、在一个地方绕开了、没有追到根上。
+
+### ★ B. 跨解释器对象串号 —— 不崩,给错数据
+
+`map_elements` 的 `return_dtype` 经 Rust 回到 Python 时,拿到的是**别的解释器的
+`Int64` 类对象**:
+
+```
+解释器 1 的回调里   id(type(拿到的 Int64)) == 解释器 2 的 pl.Int64 的 id
+N=2 时 28 个 worker 里 14 个中招(50%)
+用户看到:TypeError: cannot parse input of type 'Int64' into Polars data type (given: Int64)
+```
+
+那条错误消息自指("Int64 不能被解析成 Int64")本身就是串号的指纹。
+
+**对照特别有说服力:上游版在同样的配置下大声拒绝**(`ImportError: PyO3 modules do
+not yet support subinterpreters`),而这个分支**默默给你别的解释器的对象**。
+把"不支持就报错"换成了"静默给错数据",这比崩溃更糟。
+
+### C. 销毁子解释器时段错误
+
+`≥2` 个解释器做过 polars 并行计算之后销毁,`writefile`(**完全不经 Python 回调**)
+和 `compute`(**完全不写**)都崩,而 `import` / 建 `DataFrame` 不崩:
+
+```
+N=2  1/3 崩    N=3  3/3    N=4  3/3    N=8  3/3(0.1–0.2s,第一轮就崩)
+```
+
+栈之一点名了本分支的 `per_interpreter::teardown` 在 `Py_EndInterpreter` 期间做
+`PyImport_ImportModule` —— finalize 中途 import 本身就危险。
+
+**但这条归因最弱**:它只在 own-GIL 下出现,而 own-GIL 只有本分支进得去,
+所以做不了 A/B。它也可能是 CPython 3.14 自身在多 own-GIL + 原生线程池下的问题。
+
+### D. 每个子解释器生命周期泄漏 ~60KB,import 慢 3.7 倍
+
+一次只活一个解释器(建 → import → 写 → 关),1200 轮零崩溃,但 RSS 线性涨:
+
+```
+own-GIL N=1 1200 轮   +51 KB/轮,前半 56 / 后半 46 —— 略减速,但 1200 轮内无平台
+分离来源(400 轮):
+  纯 CPython           +4 KB/轮    ← 基线
+  只 import polars     +50 KB/轮   ← ★ 泄漏在这
+  再写 1 次            +62 KB/轮
+  写 200 次            +49 KB/轮   ← 和写次数无关
+```
+
+**legacy(shared-GIL)配置下的 A/B 是干净的,归因明确:**
+
+```
+上游 .so    330 轮 RSS 92.9 → 93.1 MB   +0.6 KB/轮(平)   用时  7.1s
+本分支 .so  330 轮 RSS 93.7 → 114.3 MB  +62 KB/轮(线性) 用时 26.5s   ← 慢 3.7 倍
+```
+
+### 没覆盖到的面
+
+```
+· own-GIL 下【没有对照组】—— 上游根本进不去,A/C 只能证明"在本分支唯一能用的配置里存在"
+· 只测了 write 路径,没测 read(InterpreterHandle 同样挂在 PyFileLikeObject::read 上)
+· 没测 streaming engine / map_batches / 其它 Rust→Python 回调
+· 只测了 macOS。这里的 abort 来自 libmalloc 的指针检查;
+  ★ Linux glibc 大概率【不 abort】而是静默堆破坏 —— Linux 上更难发现,不是更少
+· 没测 free-threaded build
+· Bug A 在低并发长时间下的累积概率没量化
+```
