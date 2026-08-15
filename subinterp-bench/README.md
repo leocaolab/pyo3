@@ -18,6 +18,7 @@ stress.py     长跑:隔离 / 结果正确性 / 存活
 
 METHOD.md     测量纪律 —— 改基准前先看
 POLARS.md     polars 在子解释器里的完整实测记录
+POLARS-PATCH.md  给 polars 的补丁:回调回正确的解释器
 ```
 
 `leak.py` 和 `reclaim.py` 问的**不是同一件事**,两个都要跑:前者一次只活一个解释器、

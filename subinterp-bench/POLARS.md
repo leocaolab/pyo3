@@ -170,18 +170,25 @@ polars 用 rayon worker 线程回调 Python 写数据(`crates/polars-python/src/
                           ★ 只是让崩溃消失,【跨解释器写对象这件事本身还在】
 ② 避开回调路径             零代价。write_csv 给真文件路径;parquet/ipc 给 BytesIO
                           (走快路径);write_json 本来就安全
-③ 修 polars               让 PyFileLikeObject 记住收到文件对象时所在的解释器,
-                          worker 线程 attach 回【那个】解释器,而不是靠 PyGILState_Ensure
+③ 修 polars               ★ 已做,见 POLARS-PATCH.md —— 一个文件,12 行加 5 行改。
+                          让 PyFileLikeObject 记住收到文件对象时所在的解释器,
+                          worker 线程 attach 回【那个】解释器。
+                          实测:四条写出路径全部从「写在主解释器 0 → 中止」
+                          变成「写在解释器 1 → OK」,且不需要 PYTHONMALLOC=malloc
 ```
 
 **① 只是止血。**它让 realloc 不再跨 zone,但那个 rayon 线程仍然在主解释器里改
-子解释器的对象。要真修得走 ③。
+子解释器的对象。**真修是 ③,已经做了** —— 见 [`POLARS-PATCH.md`](POLARS-PATCH.md)。
 
 #### 这是 PyO3 层面的通用陷阱,不是 polars 特有
 
 **任何 PyO3 扩展,只要从一个 PyO3 没 attach 过的线程调 `Python::attach` 回调 Python,
 在子解释器下就会静默地落到主解释器。** rayon、tokio 的 `spawn_blocking`、
 自建线程池都是这个形状。用子解释器的项目值得把这类调用点排查一遍。
+
+本分支为此加了 `pyo3::sync::InterpreterHandle`:在拿到 Python 对象的地方
+`InterpreterHandle::current(py)` 捕获解释器,在 worker 线程 `handle.attach(|py| ...)`
+attach 回那一个。单解释器下走 fast path,行为和 `Python::attach` 一致。
 
 > `to_arrow` 在这台机器上报 `ModuleNotFoundError: pyarrow` —— 是环境没装,不是缺陷。
 
