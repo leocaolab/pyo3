@@ -48,6 +48,13 @@ cargo update -p pyo3
 
 然后确认 `Cargo.lock` 里 pyo3 那条**没有 `source =` 行**(有 source 就是 registry 版)。
 
+### abi3(限定 API)
+
+**支持,但这条路上有过三个 bug,都是 polars 逼出来的**(见下)。如果你的项目用
+`abi3-pyXY` 且 XY < 12,`Py_mod_multiple_interpreters` 这个 slot 在编译期发不出去 ——
+本分支的做法是**预留槽位、在 `PyInit_` / `make_module` 里按运行时版本填**。所以
+abi3-py310 的模块跑在 3.14 上也能拿到严格模式免开关。
+
 ### macOS 上裸 `cargo build`
 
 maturin 会带 `-undefined dynamic_lookup`,`cargo build` 不带,会报一大串
@@ -61,7 +68,7 @@ RUSTFLAGS="-C link-arg=-undefined -C link-arg=dynamic_lookup" cargo build --rele
 
 ## 改了什么
 
-只有五个文件,其余全是 `subinterp-bench/`。
+只有五个文件(第 4 和第 6 节都在 `pymodule.rs`),其余全是 `subinterp-bench/`。
 
 ### 1. `src/sync/per_interpreter.rs`(新增)
 
@@ -130,6 +137,23 @@ decref,否则把 decref 塞进一个**进程级**延迟队列。而 `thread_is_a
 
 **TLS 地址缓存(性能)。** `ATTACH_COUNT` 原本每次 FFI 调用被访问两次(进 +1、出 −1),
 dylib 里每次都走 `tlv_get_addr`。改成进来时取一次地址存进 guard,`Drop` 直接用。
+
+### 6. abi3 下的 slot 解析(`src/impl_/pymodule.rs`)
+
+abi3 构建的编译期 cfg 取的是**最低**目标版本。polars 用 `abi3-py310`,于是
+`Py_3_12` 没设,`with_per_interpreter_gil` 编译成空操作,模块什么都没声明。
+
+不能无条件发:slot ID 3 在 3.12 以下会让 CPython 报 `unknown slot ID`,而 abi3
+构建在编译期不知道自己将来跑在哪个版本上。
+
+做法:abi3 时**预留一个占位槽位**(id 用 −1,CPython 从不用负数 slot),在 CPython
+读 `m_slots` 之前的最后一刻按运行时版本决定 —— 填上真 slot,或把它从数组里抹掉。
+版本用 `Py_GetVersion()` 取(`Py_Version` 是 3.11 才有的符号,abi3-py310 引用不到),
+常量写字面值 `2`(常量本身 cfg 到 Py_3_12)。
+
+顶层模块和子模块**两条路都要补**:顶层走 `init_multi_phase`,子模块走 `make_module`。
+只补前者会让占位符原样交给 CPython —— `SystemError: module _ir_nodes uses unknown slot ID`。
+改写要前移数组,不是原子操作,所以用 `compare_exchange` 保证只做一次。
 
 ---
 
@@ -212,6 +236,40 @@ x86_64,Ubuntu 26.04)。Python 3.14。**对照一律是本分支的父提交 `dfd
 
 ---
 
+## 在 polars 上的实测
+
+polars 0.55.1(纯 Rust,77 个 `#[pyclass]`,`abi3-py310`,用 `wrap_pymodule!` 注册
+`_ir_nodes` / `_expr_nodes`),4 个 own-GIL 子解释器:
+
+```
+上游 0.29.0   override  1/4   PanicException → ImportError (pyo3#576,子模块守卫)
+              strict    0/4   ImportError: does not support loading in subinterpreters
+★ 本分支      override  4/4   模块 4 个地址   PyDataFrame 类型 4 个地址
+              strict    4/4   同上,不需要任何进程级开关
+```
+
+**要点:上游那条路上,override 救不了 polars。** 它的子模块撞的是 `make_module`
+的守卫,那个**没有开关** —— 一个解释器成功,其余全抛。所以 polars 在上游 PyO3 上
+根本没法用子解释器,不管开关怎么翻。
+
+### polars 逼出的三个 bug
+
+这三个**本仓库的基准一个都抓不到**,因为它们全是默认 ABI + 顶层模块:
+
+```
+① 限定 API 下编不过     PyObject_CallMethodNoArgs / OneArg 不在里面
+② 限定 API 下 slot 发不出  abi3 的编译期 cfg 取最低版本,gate 直接成空操作
+③ 占位符泄漏到子模块     ②的修法自己造的,当场被 polars 抓到
+```
+
+已经补上:`subinterp-bench/build.sh` 现在编 **8 份**探针
+({对照, 本分支} × {默认 ABI, abi3-py310} × {顶层, 含子模块}),
+`matrix.py` 跑能力矩阵。polars 的每个症状现在几秒就能复现,不用等七分钟的构建。
+
+**这条教训值得单独记:行为维度测得再密,也补不上构建维度的零覆盖。**
+
+---
+
 ## 没解决的
 
 ### 第二堵墙:进程级 C 全局态
@@ -231,8 +289,6 @@ ImportError: cannot load module more than once per process
 - 79 处 cache site 里约 **20 处未做运行时判定**(`Py<PyAny>` / `Py<PyTzInfo>` / `Py<PyModule>` 等)
 - 只验过 **Python 3.14**;Windows stable API on 3.9 走的是回退分支,**没测过**
 - 上游测试套件里**没有一个用例能抓到**那个延迟 decref 泄漏 —— 我自己的压测也漏了它
-- `subinterp-bench/stress.py` 有两个已知问题(断言冻结了旧探针的行为;泄漏斜率判据和
-  它自己的总量互相矛盾),**未修,待定**
 - **没有向上游提过** —— 提之前至少要补上"能防住这类回归的测试"
 
 ---
@@ -252,8 +308,14 @@ src/impl_/pymodule.rs                   字段 + 守卫 + slot
 src/internal/state.rs                   guard + TLS 地址
 ```
 
-rebase 之后**必跑**:`cargo test --lib`、`subinterp-bench/leak.py`、
-`subinterp-bench/no_override.py`。前者防语义回归,后两者防这个分支特有的两类回归。
+rebase 之后**必跑**:
+
+```bash
+cargo test --lib --release                    # 语义回归
+cargo build --release --features abi3-py310   # ★ 构建维度 —— 三个 bug 都从这来
+subinterp-bench/build.sh && subinterp-bench/matrix.py   # 八格能力矩阵
+subinterp-bench/leak.py 300                   # 泄漏斜率
+```
 
 ### 重跑基准时的硬要求
 
@@ -286,21 +348,25 @@ rebase 之后**必跑**:`cargo test --lib`、`subinterp-bench/leak.py`、
 ## 提交序
 
 ```
-07b0178  feat(sync): per-interpreter storage for pyclass type objects
-f6a86a4  fix(sync): give PerInterpreterCell a non-zero size
-cc09cbc  fix(sync): release per-interpreter values at interpreter teardown
-de6c9a3  fix(exceptions): per-interpreter storage for create_exception! type objects
-b69abc8  docs: retrospective on the sub-interpreter isolation work
-799ab51  perf(sync): native array + tagged thread-local base
-a37a2bf  docs: restore the status section dropped while rewriting the perf one
-7bf6212  bench: reproducible sub-interpreter benchmarks
-7b90c8b  fix(sync): decref per-interpreter values instead of deferring them
-033a009  bench: compare four parallel topologies
-0310b03  bench: run every cell in its own process
-4cc8c55  bench: find the free-threaded interpreter instead of hardcoding a path
-d8d1dd2  bench: stop charging sub-interpreter setup to its throughput
-3a51989  bench: repeat every cell and print the spread
-eea2ce3  perf: one thread-local lookup per FFI call, one FFI call per type lookup
-cd020f3  fix(pymodule): per-interpreter module object, and drop the guard it forced
-3840e20  feat(pymodule): declare Py_MOD_PER_INTERPRETER_GIL_SUPPORTED
+07b0178 feat(sync): per-interpreter storage for pyclass type objects
+f6a86a4 fix(sync): give PerInterpreterCell a non-zero size
+cc09cbc fix(sync): release per-interpreter values at interpreter teardown
+de6c9a3 fix(exceptions): per-interpreter storage for create_exception! type objects
+b69abc8 docs: retrospective on the sub-interpreter isolation work
+799ab51 perf(sync): native array + tagged thread-local base, closing the 2.75x regression
+a37a2bf docs: restore the status section dropped while rewriting the perf one
+7bf6212 bench: reproducible sub-interpreter benchmarks, and a reclaim regression they found
+7b90c8b fix(sync): decref per-interpreter values instead of deferring them
+033a009 bench: compare four parallel topologies, with two controls that change the answer
+0310b03 bench: run every cell in its own process, and stop the harness from serialising
+4cc8c55 bench: find the free-threaded interpreter instead of hardcoding a Homebrew path
+d8d1dd2 bench: stop charging sub-interpreter setup to the sub-interpreter's throughput
+3a51989 bench: repeat every cell and print the spread, because one shot is not a result
+eea2ce3 perf: one thread-local lookup per FFI call, one FFI call per type lookup
+cd020f3 fix(pymodule): per-interpreter module object, and drop the guard it forced
+3840e20 feat(pymodule): declare Py_MOD_PER_INTERPRETER_GIL_SUPPORTED
+9943df8 docs: journal for this customised build
+4a1c57a fix(sync): use limited-API-safe calls in the teardown path
+95082f3 fix(pymodule): fill the multiple-interpreters slot at runtime on abi3
+30937fd bench: cover the build dimension, which is where the last three bugs came from
 ```

@@ -97,8 +97,10 @@ for r in range(1, ROUNDS + 1):
     errors += err[:2]
 
     # B. 每个解释器的结果必须是【它自己那份种子】的正确答案
+    # probe 里 Counter 是 total += seed*k,起始 0 —— bump(1) 做 BUMPS 次就是 seed*BUMPS。
+    # (旧断言写的是 seed + BUMPS,冻结的是并入共用探针【之前】那个 Counter 的算法。)
     for s, tot, _tid in out:
-        if tot != s + BUMPS:
+        if tot != s * BUMPS:
             bad_result += 1
     # C. N 个解释器 = N 个不同 type 地址
     if out and len(set(t for _, _, t in out)) != len(out):
@@ -120,10 +122,17 @@ print("\n" + "-" * W)
 print(f"A. 泄漏      基线 {base_rss:.1f} MB → 结束 {final:.1f} MB  "
       f"(增长 {final-base_rss:+.1f} MB / {ROUNDS*WORKERS:,} 个解释器)")
 if len(samples) >= 3:
-    mid = samples[len(samples)//2]
-    slope = (final - mid[1]) / max(ROUNDS - mid[0], 1) * 1000
-    print(f"             后半程斜率 {slope:+.2f} MB / 千轮   "
-          f"{'✅ 平稳' if abs(slope) < 5 else '★ 持续增长,疑似泄漏'}")
+    # 按【解释器】算,不按轮 —— 一轮建 WORKERS 个,按轮算出来的数没法和 leak.py 比,
+    # 也没法和上面那行总量对账。旧版就是这么给出「总量在减速、斜率却在上升」的。
+    mid = samples[len(samples) // 2]
+    d_mb = final - mid[1]
+    d_interp = max((ROUNDS - mid[0]) * WORKERS, 1)
+    slope = d_mb / d_interp * 1000
+    overall = (final - base_rss) / (ROUNDS * WORKERS) * 1000
+    verdict = "✅ 平稳" if slope <= overall + 0.5 else "★ 后半程比整体还快,疑似泄漏"
+    print(f"             后半程 {slope:+.2f} MB/千个解释器   整体 {overall:+.2f}   {verdict}")
+    print(f"             (判据是后半程不快于整体 —— 收敛的过程整体会被前期抬高,"
+          f"后半程必然更低)")
 print(f"B. 结果正确  {'✅ 全部正确' if bad_result == 0 else f'★ {bad_result} 次错误'}")
 print(f"C. 类型独立  {'✅ 每轮都是 N 个不同 type' if bad_isolation == 0 else f'★ {bad_isolation} 轮出现共享'}")
 print(f"D. 存活      ✅ 跑完未崩溃   用时 {el:.0f}s")
