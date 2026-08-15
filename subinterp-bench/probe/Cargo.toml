@@ -17,6 +17,11 @@ crate-type = ["cdylib"]
 # 所有基准的对照列一起废掉。默认关,只有 submodule.py 打开它。
 submodule = []
 
+# 限定 API 构建。polars 用的就是这个,而它逼出了三个只在这条路上才出现的 bug:
+# 两个 FFI 函数不在限定 API 里、slot 因编译期 cfg 只到 3.10 而发不出、
+# 占位符泄漏到子模块。基准里【一个 abi3 构建都没有】,所以一个都没抓到。
+abi3 = ["pyo3/abi3-py310"]
+
 [dependencies]
 pyo3 = { version = "0.29", features = ["extension-module"] }
 

@@ -1,6 +1,8 @@
 use pyo3::prelude::*;
 #[cfg(feature = "submodule")]
 use pyo3::wrap_pymodule;
+// PyBuffer 不在限定 API 里,abi3 构建下整条 sum_buf 都要关掉。
+#[cfg(not(feature = "abi3"))]
 use pyo3::buffer::PyBuffer;
 
 /// 纯空调用:隔离框架的每次调用开销
@@ -9,14 +11,18 @@ use pyo3::buffer::PyBuffer;
 /// 定长缓冲区求和:有可测的工作量,驻留 L1,零分配
 /// 裸指针本身不是 Send;包一层,由调用方保证 buffer 在 detach 期间存活
 /// (PyBuffer 持有对该对象的引用,它在整个函数体内存活)。
+#[cfg(not(feature = "abi3"))]
 struct SendPtr(*const f64);
+#[cfg(not(feature = "abi3"))]
 unsafe impl Send for SendPtr {}
+#[cfg(not(feature = "abi3"))]
 impl SendPtr {
     /// 通过方法取值,这样闭包捕获的是整个 `SendPtr` 而不是里面那个裸指针字段
     /// (Rust 2021 的闭包按字段捕获,直接写 `p.0` 会捕获 `*const f64`,它不是 Send)。
     #[inline] fn get(&self) -> *const f64 { self.0 }
 }
 
+#[cfg(not(feature = "abi3"))]
 #[pyfunction]
 fn sum_buf(buf: PyBuffer<f64>, py: Python<'_>) -> f64 {
     let n = buf.item_count();
@@ -124,6 +130,7 @@ static RAW_NOOP: RawDef = RawDef(pyo3::ffi::PyMethodDef {
     m.add_function(wrap_pyfunction!(interp_id_ns, m)?)?;
     m.add_function(wrap_pyfunction!(type_lookup_ns, m)?)?;
     m.add_function(wrap_pyfunction!(noop, m)?)?;
+    #[cfg(not(feature = "abi3"))]
     m.add_function(wrap_pyfunction!(sum_buf, m)?)?;
     m.add_class::<Row>()?;
     m.add_class::<Counter>()?;
