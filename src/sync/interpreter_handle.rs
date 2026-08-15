@@ -88,7 +88,7 @@ impl InterpreterHandle {
     where
         F: for<'py> FnOnce(Python<'py>) -> R,
     {
-        let current = current_interpreter_or_null();
+        let current = crate::internal::state::current_interpreter_or_null();
 
         if current == self.0 {
             // Already here. Take the fast path, and tell PyO3 the thread is attached so that
@@ -133,37 +133,6 @@ impl InterpreterHandle {
             ffi::PyThreadState_Delete(tstate);
         }
         result
-    }
-}
-
-/// The interpreter this thread is attached to, or null if it is attached to none.
-///
-/// `PyInterpreterState_Get` cannot answer this — it is fatal when there is no thread state, so it
-/// can only be called once you already know.
-#[inline]
-fn current_interpreter_or_null() -> *mut ffi::PyInterpreterState {
-    #[cfg(all(Py_3_13, not(Py_LIMITED_API), not(PyPy), not(GraalPy)))]
-    {
-        // SAFETY: this one is explicitly null-returning rather than fatal.
-        let tstate = unsafe { ffi::PyThreadState_GetUnchecked() };
-        if tstate.is_null() {
-            return core::ptr::null_mut();
-        }
-        // SAFETY: `tstate` is non-null and current.
-        return unsafe { ffi::PyThreadState_GetInterpreter(tstate) };
-    }
-    // Limited API and older versions have no null-returning accessor, so fall back to PyO3's own
-    // attach count. It misses a thread that CPython attached without PyO3 seeing it — the same
-    // blind spot `AssumeAttached` exists for — so on those builds do not call `attach` from
-    // inside a raw CPython callback.
-    #[cfg(not(all(Py_3_13, not(Py_LIMITED_API), not(PyPy), not(GraalPy))))]
-    {
-        if crate::internal::state::thread_is_attached() {
-            // SAFETY: PyO3 says this thread is attached, so there is a thread state.
-            unsafe { ffi::PyInterpreterState_Get() }
-        } else {
-            core::ptr::null_mut()
-        }
     }
 }
 

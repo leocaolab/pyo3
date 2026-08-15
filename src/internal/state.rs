@@ -10,7 +10,7 @@ use crate::{ffi, Python};
 
 use core::cell::Cell;
 #[cfg(not(pyo3_disable_reference_pool))]
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 #[cfg_attr(pyo3_disable_reference_pool, allow(unused_imports))]
 use core::{mem, ptr::NonNull};
 #[cfg(not(pyo3_disable_reference_pool))]
@@ -219,8 +219,31 @@ impl Drop for AttachGuard {
     }
 }
 
+/// 这个线程当前附着的解释器,没有则 NULL。
+///
+/// 不能用 `PyInterpreterState_Get` —— 它在没有 thread state 时是 fatal,不能拿来"问"。
+/// `PyGILState_GetThisThreadState` 在稳定 ABI 里,而且返回 NULL 而不是 fatal。
+#[inline]
+pub(crate) fn current_interpreter_or_null() -> *mut ffi::PyInterpreterState {
+    // SAFETY: this one is explicitly null-returning.
+    let tstate = unsafe { ffi::PyGILState_GetThisThreadState() };
+    if tstate.is_null() {
+        return core::ptr::null_mut();
+    }
+    // SAFETY: `tstate` is non-null.
+    #[cfg(any(not(Py_LIMITED_API), Py_3_10))]
+    unsafe {
+        ffi::PyThreadState_GetInterpreter(tstate)
+    }
+    // 3.9 的限定 API 没有 PyThreadState_GetInterpreter。那里退回"分不出解释器",
+    // 池子会走保守路径 —— 见 `ReferencePool::drop_deferred_references_slow`。
+    #[cfg(all(Py_LIMITED_API, not(Py_3_10)))]
+    core::ptr::null_mut()
+}
+
 #[cfg(not(pyo3_disable_reference_pool))]
-type PyObjVec = Vec<NonNull<ffi::PyObject>>;
+/// 每条待释放引用连同它属于的解释器。NULL 表示登记时分辨不出。
+type PyObjVec = Vec<(*mut ffi::PyInterpreterState, NonNull<ffi::PyObject>)>;
 
 #[cfg(not(pyo3_disable_reference_pool))]
 /// Thread-safe storage for objects which were dec_ref while not attached.
@@ -230,6 +253,12 @@ struct ReferencePool {
     // on this flag.
     dirty: AtomicBool,
     pending_decrefs: Mutex<PyObjVec>,
+    /// 见过的第一个解释器,以及是否见过第二个。
+    ///
+    /// 单解释器进程(绝大多数)必须保持原有行为:全部释放。只有真的出现了第二个
+    /// 解释器,才需要按解释器分拣 —— 那时"分辨不出归属"的条目宁可泄漏也不能释放。
+    first_interp: AtomicPtr<ffi::PyInterpreterState>,
+    multiple_seen: AtomicBool,
 }
 
 #[cfg(not(pyo3_disable_reference_pool))]
@@ -238,11 +267,32 @@ impl ReferencePool {
         Self {
             dirty: AtomicBool::new(false),
             pending_decrefs: Mutex::new(Vec::new()),
+            first_interp: AtomicPtr::new(core::ptr::null_mut()),
+            multiple_seen: AtomicBool::new(false),
+        }
+    }
+
+    /// 记下见过哪个解释器,并在见到第二个时翻开保守模式。
+    fn note_interpreter(&self, interp: *mut ffi::PyInterpreterState) {
+        if interp.is_null() || self.multiple_seen.load(Ordering::Relaxed) {
+            return;
+        }
+        match self.first_interp.compare_exchange(
+            core::ptr::null_mut(),
+            interp,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => {}
+            Err(existing) if existing == interp => {}
+            Err(_) => self.multiple_seen.store(true, Ordering::Relaxed),
         }
     }
 
     fn register_decref(&self, obj: NonNull<ffi::PyObject>) {
-        self.pending_decrefs.lock().unwrap().push(obj);
+        let interp = current_interpreter_or_null();
+        self.note_interpreter(interp);
+        self.pending_decrefs.lock().unwrap().push((interp, obj));
         self.dirty.store(true, Ordering::Relaxed);
     }
 
@@ -281,8 +331,34 @@ impl ReferencePool {
         let decrefs = mem::take(&mut *pending_decrefs);
         drop(pending_decrefs);
 
-        for ptr in decrefs {
-            unsafe { ffi::Py_DECREF(ptr.as_ptr()) };
+        // 单解释器进程:和以前完全一样,全部释放。
+        if !self.multiple_seen.load(Ordering::Relaxed) {
+            for (_, ptr) in decrefs {
+                // SAFETY: the thread is attached and there is only one interpreter.
+                unsafe { ffi::Py_DECREF(ptr.as_ptr()) };
+            }
+            return;
+        }
+
+        // 多解释器:只释放属于【当前这个】解释器的。别人的放回去等它自己来收;
+        // 分辨不出归属的也放回去 —— 在错误的解释器里释放是内存损坏,泄漏只是泄漏。
+        //
+        // 这是压测抓到的那个 abort:进程级的池子把 A 的对象交给 B 释放,
+        // 指针不在 B 的 arena 里,libmalloc 当场 abort;而在 glibc 上它不 abort,
+        // 只是静默损坏堆。
+        let current = current_interpreter_or_null();
+        let mut keep = Vec::new();
+        for (interp, ptr) in decrefs {
+            if !current.is_null() && interp == current {
+                // SAFETY: the object belongs to the interpreter this thread is attached to.
+                unsafe { ffi::Py_DECREF(ptr.as_ptr()) };
+            } else {
+                keep.push((interp, ptr));
+            }
+        }
+        if !keep.is_empty() {
+            self.pending_decrefs.lock().unwrap().extend(keep);
+            self.dirty.store(true, Ordering::Relaxed);
         }
     }
 }
@@ -490,7 +566,9 @@ mod tests {
             .pending_decrefs
             .lock()
             .unwrap()
-            .contains(&unsafe { NonNull::new_unchecked(obj.as_ptr()) })
+            // 表里现在每条带着它属于的解释器,查法跟着改;断言("在不在表里")没变。
+            .iter()
+            .any(|(_, p)| *p == unsafe { NonNull::new_unchecked(obj.as_ptr()) })
     }
 
     // With free-threading, threads can empty the POOL at any time, so this
@@ -501,7 +579,9 @@ mod tests {
             .pending_decrefs
             .lock()
             .unwrap()
-            .contains(&unsafe { NonNull::new_unchecked(obj.as_ptr()) })
+            // 表里现在每条带着它属于的解释器,查法跟着改;断言("在不在表里")没变。
+            .iter()
+            .any(|(_, p)| *p == unsafe { NonNull::new_unchecked(obj.as_ptr()) })
     }
 
     #[test]
