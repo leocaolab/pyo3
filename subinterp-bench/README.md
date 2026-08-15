@@ -15,6 +15,9 @@ single.py     单线程热路径:确认改动没有在无争用时收费
 leak.py       串行建/关 N 个解释器,看 RSS 斜率        ← ★ 抓到过一个 2.6MB/解释器 的泄漏
 reclaim.py    一批解释器关闭后立刻收回多少
 stress.py     长跑:隔离 / 结果正确性 / 存活
+
+METHOD.md     测量纪律 —— 改基准前先看
+POLARS.md     polars 在子解释器里的完整实测记录
 ```
 
 `leak.py` 和 `reclaim.py` 问的**不是同一件事**,两个都要跑:前者一次只活一个解释器、

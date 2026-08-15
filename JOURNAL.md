@@ -238,6 +238,10 @@ x86_64,Ubuntu 26.04)。Python 3.14。**对照一律是本分支的父提交 `dfd
 
 ## 在 polars 上的实测
 
+> 完整记录在 [`subinterp-bench/POLARS.md`](subinterp-bench/POLARS.md):怎么编、
+> 19 项 API 面逐项结果、SkyTrade 型负载的扩展曲线、以及和"每 worker 一份物理副本"
+> 的内存/磁盘/冷启动对比。下面是摘要。
+
 polars 0.55.1(纯 Rust,77 个 `#[pyclass]`,`abi3-py310`,用 `wrap_pymodule!` 注册
 `_ir_nodes` / `_expr_nodes`),4 个 own-GIL 子解释器:
 
