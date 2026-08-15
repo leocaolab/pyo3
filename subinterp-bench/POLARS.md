@@ -83,7 +83,7 @@ cargo build --release -p polars-runtime-64      # 约 6–10 分钟
 
 ---
 
-## API 面:19 项里 17 项可用
+## API 面:22 项(默认分配器 21/22,`PYTHONMALLOC=malloc` 下 22/22)
 
 在一个子解释器里(strict,不带开关)逐个跑:
 
@@ -104,22 +104,84 @@ cargo build --release -p polars-runtime-64      # 约 6–10 分钟
 异常路径也正常 —— `ColumnNotFoundError` 等作为正常 Python 异常传播,
 是 `pl.exceptions.PolarsError` 的子类,不越界、不崩。
 
-### ★ `df.write_csv()` 会中止进程
+### ★ 写出到 Python file-like 会中止进程 —— 而且根因比崩溃更严重
 
 ```
 df.write_csv()          Abort trap: 6 (exit 134),stderr 一个字都没有
 ```
 
-**这不是本分支造成的,也没被本分支修好。** 对照:
+**不是本分支造成的**(上游 `.so` + override 一样崩),也**不是 CSV 特有的**。
 
-| | `df.write_csv()` | 普通 `select` |
+#### 根因
+
+`faulthandler` 抓到的栈,里面没有一行 polars 或 PyO3 的代码:
+
+```
+_io_BytesIO_getvalue_impl → _PyBytes_Resize → realloc
+  → ___BUG_IN_CLIENT_OF_LIBMALLOC_POINTER_BEING_FREED_WAS_NOT_ALLOCATED → abort
+```
+
+跨分配器 free。为什么会跨,用一个记录**每次 `write` 发生在哪个解释器**的
+自定义 file-like 问出来了:
+
+```
+子解释器 id = 1
+两次 write 都发生在【解释器 id = 0】,也就是主解释器,而且在两个不是调用线程的线程上
+```
+
+polars 用 rayon worker 线程回调 Python 写数据(`crates/polars-python/src/file.rs`
+的 `impl Write for PyFileLikeObject` 里 `Python::attach(|py| ... call_method(py, "write", ...))`)。
+**`Python::attach` 在一个 PyO3 从未 attach 过的线程上会走 `PyGILState_Ensure`,
+而那个 API 按设计绑定主解释器**(PEP 684 的已知禁忌)。于是:
+
+```
+子解释器 1 建了 BytesIO
+   ↓  rayon 线程 attach 到【主解释器 0】,往那个 BytesIO 里写
+      → 缓冲区在主解释器的 arena 里长
+   ↓  回到子解释器 1 调 getvalue()
+      → _PyBytes_Resize 用子解释器的 arena realloc
+      → 指针不属于这个 zone → abort
+```
+
+**崩溃只是表象。真正发生的是跨解释器操作对象** —— 一个解释器的线程在改另一个
+解释器拥有的 `bytes`。不崩的时候它也是错的。
+
+#### 范围:凡是回调 Python `write()` 的路径
+
+给一个**自定义 file-like**(不是 `BytesIO`)时:
+
+| 写出方式 | 回调发生在 | 结果 |
 |---|---|---|
-| 上游 `.so` + override | **中止 134** | OK |
-| 本分支 `.so` + strict | **中止 134** | OK |
+| `write_json` | 调用线程,解释器 1(正确) | ✅ OK |
+| `write_csv` | ★ 主解释器 0 | 中止 |
+| `write_ndjson` | ★ 主解释器 0 | 中止 |
+| `write_parquet` | ★ 主解释器 0 | 中止 |
+| `write_ipc` | ★ 主解释器 0 | 中止 |
 
-**两边一样崩**,所以是 polars 自身在子解释器里的问题,和 PyO3 版本无关。
-范围很窄:只有"写成字符串"这一条,`write_parquet(BytesIO)` 和**所有读路径**都正常。
-需要 CSV 输出时,先写到真文件或用 parquet。
+给 `BytesIO` 时 `write_parquet` / `write_ipc` 不崩 —— 那是因为 polars 对 BytesIO 有
+**快路径**(`file.rs:415` "handle BytesIO specially"),压根不回调 Python。
+**规则不是"CSV 有问题",是"任何回调 Python `write()` 的路径都有问题"。**
+
+#### 三条出路,代价明确
+
+```
+① PYTHONMALLOC=malloc     22/22 全绿。所有解释器共用系统 malloc,arena 边界消失。
+                          代价:这个分配密集的负载上 +23%(0.235s → 0.290s)
+                          ★ 只是让崩溃消失,【跨解释器写对象这件事本身还在】
+② 避开回调路径             零代价。write_csv 给真文件路径;parquet/ipc 给 BytesIO
+                          (走快路径);write_json 本来就安全
+③ 修 polars               让 PyFileLikeObject 记住收到文件对象时所在的解释器,
+                          worker 线程 attach 回【那个】解释器,而不是靠 PyGILState_Ensure
+```
+
+**① 只是止血。**它让 realloc 不再跨 zone,但那个 rayon 线程仍然在主解释器里改
+子解释器的对象。要真修得走 ③。
+
+#### 这是 PyO3 层面的通用陷阱,不是 polars 特有
+
+**任何 PyO3 扩展,只要从一个 PyO3 没 attach 过的线程调 `Python::attach` 回调 Python,
+在子解释器下就会静默地落到主解释器。** rayon、tokio 的 `spawn_blocking`、
+自建线程池都是这个形状。用子解释器的项目值得把这类调用点排查一遍。
 
 > `to_arrow` 在这台机器上报 `ModuleNotFoundError: pyarrow` —— 是环境没装,不是缺陷。
 
