@@ -232,6 +232,8 @@ pub type ModuleExecSlot = unsafe extern "C" fn(*mut ffi::PyObject) -> c_int;
 const MAX_SLOTS: usize =
     // Py_mod_exec
     1 +
+    // Py_mod_multiple_interpreters
+    cfg!(Py_3_12) as usize +
     // Py_mod_gil
     cfg!(Py_3_13) as usize +
     // Py_mod_name, Py_mod_doc, and Py_mod_abi
@@ -310,6 +312,33 @@ impl PyModuleSlotsBuilder {
         {
             // safety: exce is not NULL
             self.push_value(unsafe { ffi::PySlot_FUNC(ffi::Py_mod_exec, exec as *mut c_void) })
+        }
+    }
+
+    /// Declares that this module may be loaded into sub-interpreters that own their GIL.
+    ///
+    /// Without this slot CPython refuses to import the extension into such an interpreter unless
+    /// the process opts out globally with `_imp._override_multi_interp_extensions_check(-1)`.
+    /// PyO3 could not declare it while `#[pyclass]` type objects, `create_exception!` types and
+    /// the module object itself were cached per *process*; each of those is now per-interpreter.
+    pub const fn with_per_interpreter_gil(self) -> Self {
+        #[cfg(all(Py_3_12, not(Py_3_15)))]
+        {
+            self.push(
+                ffi::Py_mod_multiple_interpreters,
+                ffi::Py_MOD_PER_INTERPRETER_GIL_SUPPORTED,
+            )
+        }
+        #[cfg(Py_3_15)]
+        {
+            self.push_value(ffi::PySlot_DATA(
+                ffi::Py_mod_multiple_interpreters,
+                ffi::Py_MOD_PER_INTERPRETER_GIL_SUPPORTED,
+            ))
+        }
+        #[cfg(not(Py_3_12))]
+        {
+            self
         }
     }
 
@@ -615,6 +644,7 @@ mod tests {
             .with_mod_exec(module_exec)
             .with_name(c"test_module")
             .with_doc(c"some doc")
+            .with_per_interpreter_gil()
             .with_gil_used(false)
             .with_abi_info();
 

@@ -548,6 +548,7 @@ fn module_initialization(
             static SLOTS: impl_::PrimaryModuleSlots = impl_::PyModuleSlotsBuilder::new()
                 .with_mod_exec(__pyo3_module_exec)
                 .with_abi_info()
+                .with_per_interpreter_gil()
                 .with_gil_used(#gil_used)
                 .with_name(__PYO3_NAME)
                 .with_doc(DOC)
