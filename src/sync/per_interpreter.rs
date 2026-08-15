@@ -468,3 +468,150 @@ where
 // interpreter that owns the value, and values are never handed across interpreters.
 unsafe impl<T: Send> Send for PerInterpreterCell<T> {}
 unsafe impl<T: Send> Sync for PerInterpreterCell<T> {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::any::PyAnyMethods;
+    use crate::{Py, PyAny, Python};
+    use std::sync::Mutex;
+
+    /// Serialises the tests below. Each one tears down the registry every cell in the process
+    /// shares, so two of them running at once would drop each other's values.
+    static TEARDOWN: Mutex<()> = Mutex::new(());
+
+    /// Drops this interpreter's registry the way CPython does at finalization, **including the
+    /// part that matters**: from a thread PyO3 has never attached.
+    ///
+    /// Deleting the key from inside `Python::attach` exercises the same code but not the same
+    /// condition — there PyO3's attach count is already non-zero, so `Py<T>`'s `Drop` decrefs
+    /// whether or not the guard exists, and the test passes against the bug. The capsule
+    /// destructor and the `atexit` hook are both entered from CPython directly; this reproduces
+    /// that by taking the GIL through the raw C API on a fresh thread, where PyO3's thread-local
+    /// count is zero.
+    ///
+    /// The caller is attached, so the GIL has to be handed over for the duration — and it has to
+    /// be handed over through the raw C API rather than [`Python::detach`]. `SuspendAttach`'s
+    /// `Drop` applies the deferred reference pool on the way back in, which would settle the very
+    /// decrefs this is here to catch and turn the test green against the bug.
+    fn drop_registry_as_cpython_would(py: Python<'_>) {
+        let _ = py;
+        // SAFETY: the caller is attached, so there is a thread state to release; no Python
+        // object is touched until it is restored below.
+        let tstate = unsafe { ffi::PyEval_SaveThread() };
+        let joined = std::thread::spawn(|| {
+            // SAFETY: taking the GIL through the C API, as CPython would before calling a
+            // capsule destructor. PyO3 does not observe this transition, which is the point.
+            unsafe {
+                let gstate = ffi::PyGILState_Ensure();
+                let dict = ffi::PyInterpreterState_GetDict(ffi::PyInterpreterState_Get());
+                assert!(!dict.is_null());
+                if ffi::PyDict_DelItemString(dict, REGISTRY_KEY.as_ptr()) < 0 {
+                    ffi::PyErr_Clear();
+                }
+                ffi::PyGILState_Release(gstate);
+            }
+        })
+        .join();
+        // SAFETY: pairs with the `PyEval_SaveThread` above, and runs whether or not the thread
+        // panicked so the caller's `Python` token is valid again either way.
+        unsafe { ffi::PyEval_RestoreThread(tstate) };
+        joined.unwrap();
+    }
+
+    fn refcount(py: Python<'_>, obj: &Py<PyAny>) -> isize {
+        // SAFETY: `obj` is a live object and the interpreter is attached.
+        let _ = py;
+        unsafe { ffi::Py_REFCNT(obj.as_ptr()) }
+    }
+
+    /// A value stored in a cell must actually be released when the registry goes away.
+    ///
+    /// This is the regression that cost 2.6 MB per interpreter, without bound. `Py<T>`'s `Drop`
+    /// only decrefs when PyO3's own thread-local attach count is above zero; otherwise it hands
+    /// the reference to a process-wide pool. CPython reaches `Registry::drop` through a capsule
+    /// destructor without going through PyO3, so the count was zero and every decref was deferred
+    /// into a pool that nothing ever applied — the drop ran and the refcount did not move.
+    ///
+    /// Nothing in the suite caught it: the leak only shows up across interpreter lifetimes, and
+    /// the stress test that did create thousands of them happened to keep an instance alive, which
+    /// routes the release through CPython's `subtype_dealloc` instead of through the registry.
+    #[test]
+    fn registry_teardown_releases_its_values() {
+        // Taken before attaching: the teardown below needs the GIL on another thread, so a test
+        // waiting here must not be holding it.
+        let _serialised = TEARDOWN.lock().unwrap_or_else(|e| e.into_inner());
+        Python::attach(|py| {
+            static CELL: PerInterpreterCell<Py<PyAny>> = PerInterpreterCell::new();
+
+            // A fresh Python class: a heap type with an ordinary refcount, so a missing decref is
+            // visible. A builtin would be immortal and its refcount would not move either way.
+            let class: Py<PyAny> = py
+                .eval(c"type('PerInterpreterProbe', (), {})", None, None)
+                .unwrap()
+                .unbind();
+
+            let before = refcount(py, &class);
+            CELL.get_or_init(py, || class.clone_ref(py));
+            assert_eq!(
+                refcount(py, &class),
+                before + 1,
+                "storing a value should hold one reference"
+            );
+
+            drop_registry_as_cpython_would(py);
+            assert_eq!(
+                refcount(py, &class),
+                before,
+                "the registry's reference must be released, not deferred into the reference pool"
+            );
+        });
+    }
+
+    /// After teardown the cell must read as empty rather than hand back a dangling pointer.
+    #[test]
+    fn cell_is_empty_after_teardown() {
+        let _serialised = TEARDOWN.lock().unwrap_or_else(|e| e.into_inner());
+        Python::attach(|py| {
+            static CELL: PerInterpreterCell<Py<PyAny>> = PerInterpreterCell::new();
+            let value: Py<PyAny> = py.None();
+            CELL.get_or_init(py, || value.clone_ref(py));
+            assert!(CELL.get(py).is_some());
+
+            drop_registry_as_cpython_would(py);
+            assert!(
+                CELL.get(py).is_none(),
+                "a stale base pointer must not survive the registry it pointed into"
+            );
+        });
+    }
+
+    /// Two cells declared next to each other must not share storage.
+    ///
+    /// They are zero-sized but for the index field, and two zero-sized fields of one struct can
+    /// share an address — which made both cells claim the same slot, overwrite each other, and
+    /// abort all 850 tests with a null type pointer.
+    #[test]
+    fn neighbouring_cells_have_distinct_slots() {
+        let _serialised = TEARDOWN.lock().unwrap_or_else(|e| e.into_inner());
+        Python::attach(|py| {
+            struct Pair {
+                a: PerInterpreterCell<Py<PyAny>>,
+                b: PerInterpreterCell<Py<PyAny>>,
+            }
+            static PAIR: Pair = Pair {
+                a: PerInterpreterCell::new(),
+                b: PerInterpreterCell::new(),
+            };
+
+            let first: Py<PyAny> = py.eval(c"'first'", None, None).unwrap().unbind();
+            let second: Py<PyAny> = py.eval(c"'second'", None, None).unwrap().unbind();
+            PAIR.a.get_or_init(py, || first.clone_ref(py));
+            PAIR.b.get_or_init(py, || second.clone_ref(py));
+
+            assert!(PAIR.a.get(py).unwrap().bind(py).eq("first").unwrap());
+            assert!(PAIR.b.get(py).unwrap().bind(py).eq("second").unwrap());
+            drop_registry_as_cpython_would(py);
+        });
+    }
+}
