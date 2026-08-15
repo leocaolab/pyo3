@@ -13,12 +13,20 @@
   PyRow        纯 Python 类
                —— 用来判断某个现象是不是扩展特有的
 
-没有这两条对照,免 GIL 下那个 0.08× 会被记在 PyO3 头上。实际上裸 C ABI
-一样塌,而纯 Python 类扩展到 6.9× —— 那是 CPython 对【扩展在运行时创建的
-PyCFunction】没上延迟引用计数,和 PyO3 无关。
+没有这两条对照,免 GIL 下 C 扩展调用不扩展会被记在 PyO3 头上。实际上手写的
+裸 C ABI 塌得一样(甚至更狠),而纯 Python 类正常扩展 —— 那是 CPython 给自己的
+内建函数和 Python 函数上了延迟引用计数,而扩展在运行时创建的 PyCFunction 没有。
 
-用法: python3.14 topology.py              跑全部四列
-      FT_PYTHON=/path/to/python3.14t python3.14 topology.py
+量级强烈依赖平台,不要引单台机器的数:
+
+  扩展 C 函数调用 @ 12 线程    macOS ARM64  0.09×      Linux x86_64  0.45×
+  MT 的 detach 负载           macOS ARM64  0.35×      Linux x86_64  1.11×
+
+跨两台机器成立的只有方向:扩展调用在免 GIL 下【不扩展】(处处 < 1×),
+而纯 Python 和 detach 计算正常。
+
+用法: python3.14 topology.py              跑全部四列(每格重复 REPS 次取中位数)
+      REPS=3 FT_PYTHON=/path/to/python3.14t python3.14 topology.py
 """
 import os, subprocess, sys, threading, time, warnings
 
@@ -26,6 +34,7 @@ warnings.filterwarnings("ignore")
 
 SECS = 1.0
 WORKERS = 12
+REPS = int(os.environ.get("REPS", "5"))    # 每格重复几次取中位数
 HERE = os.path.dirname(os.path.abspath(__file__))
 FT_SO = os.environ.get("FT_SO", "/tmp/ft_base")
 
@@ -251,6 +260,12 @@ if ft_err:
 print(f"  {'负载':32}" + "".join(f"{c:>14}" for c, *_ in COLS) + f"{'单 worker':>12}")
 print("  " + "-" * (W - 4))
 
+def median(xs):
+    s = sorted(xs)
+    m = len(s) // 2
+    return s[m] if len(s) % 2 else (s[m - 1] + s[m]) / 2
+
+
 for label, stmt in CASES:
     cells, base_rate = [], None
     for name, py, kind, so in COLS:
@@ -258,17 +273,21 @@ for label, stmt in CASES:
             cells.append("—")
             continue
         try:
-            many = cell(py, kind, so, stmt, WORKERS)
-            one = cell(py, kind, so, stmt, 1)
+            # 单次测量不作数 —— 同一格重复到 5 次能给出 0.91 到 0.99 的比值,
+            # 拿其中一次当结论,就会为一个不存在的差异去找解释。
+            many = [cell(py, kind, so, stmt, WORKERS) for _ in range(REPS)]
+            one = [cell(py, kind, so, stmt, 1) for _ in range(REPS)]
+            ratios = sorted(m / o for m, o in zip(sorted(many), sorted(one)))
             if base_rate is None:
-                base_rate = one
-            cells.append(f"{many / one:.2f}×")
+                base_rate = median(one)
+            span = (ratios[-1] - ratios[0]) / median(ratios) * 100
+            cells.append(f"{median(ratios):.2f}×±{span:.0f}%")
         except Exception as e:
             cells.append(str(e)[:13])          # 崩溃/报错原样带出,不用哨兵词
     rate = f"{base_rate / 1e6:.1f}M/s" if base_rate else "—"
     print(f"  {label:32}" + "".join(f"{c:>14}" for c in cells) + f"{rate:>12}")
 
 print("=" * W)
-print("  倍数 = 该拓扑下 12 worker 吞吐 ÷ 同拓扑 1 worker 吞吐;单 worker 列取第一个成功的拓扑。")
+print("  倍数 = 中位数 ± 跨度,每格重复 5 次。跨度大于两列之差时,那个差不是结论。")
 print("  每个单元格独占一个子进程 —— MI 对照跑建对象时会 SIGSEGV,那是结果的一部分。")
 print("=" * W)
