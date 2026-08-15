@@ -115,6 +115,66 @@ static RAW_NOOP: RawDef = RawDef(pyo3::ffi::PyMethodDef {
     Ok(())
 }
 
+
+// ── 对象创建的成本阶梯 ────────────────────────────────────────────────
+// 手写两个裸 C 类型,除了 GC 标志之外完全一样。和 PyO3 的 #[pyclass] 并排跑,
+// 就能把「GC 跟踪的钱」和「PyO3 包装层的钱」分开,而不是笼统说「慢 17%」。
+
+#[repr(C)]
+struct RawRow { ob_base: pyo3::ffi::PyObject, a: f64, b: i64 }
+
+unsafe extern "C" fn rawrow_new(
+    subtype: *mut pyo3::ffi::PyTypeObject,
+    _args: *mut pyo3::ffi::PyObject,
+    _kwds: *mut pyo3::ffi::PyObject,
+) -> *mut pyo3::ffi::PyObject {
+    let alloc = (*subtype).tp_alloc.unwrap();
+    let obj = alloc(subtype, 0);
+    if !obj.is_null() {
+        let r = obj as *mut RawRow;
+        (*r).a = 1.0;
+        (*r).b = 2;
+    }
+    obj
+}
+
+unsafe extern "C" fn rawrow_dealloc(obj: *mut pyo3::ffi::PyObject) {
+    let ty = pyo3::ffi::Py_TYPE(obj);
+    if (pyo3::ffi::PyType_GetFlags(ty) & pyo3::ffi::Py_TPFLAGS_HAVE_GC) != 0 {
+        pyo3::ffi::PyObject_GC_UnTrack(obj as *mut _);
+    }
+    let free = (*ty).tp_free.unwrap();
+    free(obj as *mut _);
+    pyo3::ffi::Py_DECREF(ty as *mut pyo3::ffi::PyObject);
+}
+
+unsafe extern "C" fn rawrow_traverse(
+    _o: *mut pyo3::ffi::PyObject,
+    _v: pyo3::ffi::visitproc,
+    _a: *mut core::ffi::c_void,
+) -> core::ffi::c_int { 0 }
+
+unsafe fn make_raw_type(name: *const core::ffi::c_char, with_gc: bool) -> *mut pyo3::ffi::PyObject {
+    let mut slots = vec![
+        pyo3::ffi::PyType_Slot { slot: pyo3::ffi::Py_tp_new, pfunc: rawrow_new as *mut _ },
+        pyo3::ffi::PyType_Slot { slot: pyo3::ffi::Py_tp_dealloc, pfunc: rawrow_dealloc as *mut _ },
+    ];
+    if with_gc {
+        slots.push(pyo3::ffi::PyType_Slot { slot: pyo3::ffi::Py_tp_traverse, pfunc: rawrow_traverse as *mut _ });
+    }
+    slots.push(pyo3::ffi::PyType_Slot { slot: 0, pfunc: core::ptr::null_mut() });
+    let mut flags = pyo3::ffi::Py_TPFLAGS_DEFAULT;
+    if with_gc { flags |= pyo3::ffi::Py_TPFLAGS_HAVE_GC; }
+    let spec = pyo3::ffi::PyType_Spec {
+        name,
+        basicsize: core::mem::size_of::<RawRow>() as i32,
+        itemsize: 0,
+        flags: flags as core::ffi::c_uint,
+        slots: slots.as_mut_ptr(),
+    };
+    pyo3::ffi::PyType_FromSpec(&spec as *const _ as *mut _)
+}
+
 #[pymodule] fn abi3t(m: &Bound<'_, PyModule>) -> PyResult<()> {
     #[cfg(feature = "submodule")]
     m.add_wrapped(wrap_pymodule!(inner))?;
@@ -134,5 +194,13 @@ static RAW_NOOP: RawDef = RawDef(pyo3::ffi::PyMethodDef {
     m.add_function(wrap_pyfunction!(sum_buf, m)?)?;
     m.add_class::<Row>()?;
     m.add_class::<Counter>()?;
+    unsafe {
+        let t1 = make_raw_type(c"RawRowNoGC".as_ptr(), false);
+        if t1.is_null() { return Err(PyErr::fetch(m.py())); }
+        m.add("RawRowNoGC", Bound::from_owned_ptr(m.py(), t1))?;
+        let t2 = make_raw_type(c"RawRowGC".as_ptr(), true);
+        if t2.is_null() { return Err(PyErr::fetch(m.py())); }
+        m.add("RawRowGC", Bound::from_owned_ptr(m.py(), t2))?;
+    }
     Ok(())
 }
