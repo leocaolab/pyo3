@@ -21,7 +21,9 @@ use crate::{
 use core::{cell::UnsafeCell, marker::PhantomData, mem::MaybeUninit};
 use std::sync::{Once, OnceState};
 
+mod interpreter_handle;
 mod per_interpreter;
+pub use interpreter_handle::InterpreterHandle;
 pub use per_interpreter::PerInterpreterCell;
 
 
