@@ -5,6 +5,11 @@
 
 ```
 probe/        被测扩展:noop / sum_buf / Row / Counter —— 每条路径隔离一种开销
+build.sh      编 8 份探针:{对照,本分支} × {默认 ABI, abi3-py310} × {顶层,含子模块}
+matrix.py     能力矩阵 —— 能不能加载、隔离到没到位   ← ★ 端到端判据
+audit_caches.py  把「持有PyObject→永生吗→堆类型吗」这条判据全量跑一遍
+no_override.py   不带任何进程级开关直接 import
+submodule.py     wrap_pymodule! 子模块能不能进子解释器
 scaling.py    多解释器并发扩展性,对照 vs fork 背靠背   ← ★ 最强的那个证据
 single.py     单线程热路径:确认改动没有在无争用时收费
 leak.py       串行建/关 N 个解释器,看 RSS 斜率        ← ★ 抓到过一个 2.6MB/解释器 的泄漏
@@ -16,6 +21,9 @@ stress.py     长跑:隔离 / 结果正确性 / 存活
 做上千次,斜率不为零就是真泄漏;后者一次建 16 个再一起关,只能看出立刻收回了多少,
 0% 也可能只是延迟释放。第一版只有 `reclaim.py`,于是一个线性不收敛的泄漏被
 当成"可疑但不致命"放过了。
+
+> **改基准或重跑基准之前先看 [`METHOD.md`](METHOD.md)** —— 那里每一条都对应一次
+> 量出假结论的经历,包括下面这条。
 
 ## 对照组必须是 fork 的父提交
 

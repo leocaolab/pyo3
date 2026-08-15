@@ -319,8 +319,7 @@ subinterp-bench/leak.py 300                   # 泄漏斜率
 
 ### 重跑基准时的硬要求
 
-这些不是风格,每一条都对应一次量出假结论的经历(细节见 `subinterp-bench/README.md`
-和各脚本的 docstring):
+完整清单在 [`subinterp-bench/METHOD.md`](subinterp-bench/METHOD.md)。摘要:
 
 ```
 对照 = 本分支的【父提交】,不是 crates.io 发行版
