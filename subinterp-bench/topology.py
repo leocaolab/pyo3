@@ -115,15 +115,23 @@ def _worker(i):
 
 
 # ── 拓扑三/四:own-GIL 子解释器 ────────────────────────────────────
-SUB_BODY = """
+#
+# 必须分两段。建一个子解释器 + import 扩展要几十到几百毫秒;把它算进计时窗口,
+# 而计数只统计测量循环,分母就被撑大 —— MI 的绝对吞吐被系统性低估几成。
+# (线程那条路没这个问题:import 在起线程之前就做完了。)
+
+SETUP_BODY = """
 import sys, _imp, time
 try: _imp._override_multi_interp_extensions_check(-1)
 except Exception: pass
 sys.path.insert(0, {so!r})
 import abi3t
 {prelude}
-for _ in range(500):
+for _ in range(500):          # 预热,也不计时
     {stmt}
+"""
+
+RUN_BODY = """
 n = 0
 deadline = time.perf_counter() + {secs}
 while time.perf_counter() < deadline:
@@ -138,39 +146,46 @@ def bench_interps(so_dir, stmt, n):
     """N 个 OS 线程,每个绑一个独立 own-GIL 子解释器。"""
     from concurrent import interpreters
 
-    body = SUB_BODY.format(so=so_dir, prelude=PRELUDE, stmt=stmt, secs=SECS)
-    got, errs, keep = [], [], []
+    setup = SETUP_BODY.format(so=so_dir, prelude=PRELUDE, stmt=stmt)
+    run = RUN_BODY.format(stmt=stmt, secs=SECS)
+
+    # ① 建好、导入、预热 —— 全部在计时之外
+    its, qs = [], []
+    for _ in range(n):
+        it = interpreters.create()
+        q = interpreters.create_queue()
+        it.prepare_main(_q=q)
+        it.exec(setup)
+        its.append(it)
+        qs.append(q)
+
+    # ② 同时开跑,每个自己跑满 SECS
+    got, errs = [], []
     lock = threading.Lock()
 
-    def work(_i):
+    def work(i):
         try:
-            it = interpreters.create()
+            its[i].exec(run)
             with lock:
-                keep.append(it)
-            q = interpreters.create_queue()
-            it.prepare_main(_q=q)
-            it.exec(body)
-            with lock:
-                got.append(q.get())
+                got.append(qs[i].get())
         except Exception as e:
             with lock:
                 errs.append(f"{type(e).__name__}: {str(e).splitlines()[-1][:70]}")
 
     ts = [threading.Thread(target=work, args=(i,)) for i in range(n)]
-    t0 = time.perf_counter()
     for t in ts:
         t.start()
     for t in ts:
         t.join()
-    el = time.perf_counter() - t0
-    for it in keep:
+    for it in its:
         try:
             it.close()
         except Exception:
             pass
     if len(got) != n:
         raise RuntimeError(errs[0] if errs else "worker 未全部完成")
-    return sum(got) / el
+    # 每个 worker 各跑满 SECS,起跑抖动在毫秒级,所以分母就是 SECS
+    return sum(got) / SECS
 
 
 # ── 每个单元格独占一个子进程 ──────────────────────────────────────
