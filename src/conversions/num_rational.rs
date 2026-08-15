@@ -44,6 +44,7 @@
 //! ```
 
 use crate::conversion::IntoPyObject;
+use crate::sync::PerInterpreterCell;
 use crate::ffi;
 #[cfg(feature = "experimental-inspect")]
 use crate::inspect::PyStaticExpr;
@@ -57,7 +58,7 @@ use crate::{Borrowed, Bound, FromPyObject, Py, PyAny, PyErr, PyResult, Python};
 use num_bigint::BigInt;
 use num_rational::Ratio;
 
-static FRACTION_CLS: PyOnceLock<Py<PyType>> = PyOnceLock::new();
+static FRACTION_CLS: PerInterpreterCell<Py<PyType>> = PerInterpreterCell::new();
 
 fn get_fraction_cls(py: Python<'_>) -> PyResult<&Bound<'_, PyType>> {
     FRACTION_CLS.import(py, "fractions", "Fraction")

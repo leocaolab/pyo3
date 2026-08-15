@@ -1,5 +1,6 @@
 use crate::err::{self, PyErr, PyResult};
 use crate::ffi_ptr_ext::FfiPtrExt;
+use crate::sync::PerInterpreterCell;
 #[cfg(feature = "experimental-inspect")]
 use crate::inspect::{type_hint_identifier, PyStaticExpr};
 use crate::instance::Bound;
@@ -31,7 +32,7 @@ unsafe impl PyTypeInfo for PySequence {
 
     #[inline]
     fn type_object_raw(py: Python<'_>) -> *mut ffi::PyTypeObject {
-        static TYPE: PyOnceLock<Py<PyType>> = PyOnceLock::new();
+        static TYPE: PerInterpreterCell<Py<PyType>> = PerInterpreterCell::new();
         TYPE.import(py, "collections.abc", "Sequence")
             .unwrap()
             .as_type_ptr()

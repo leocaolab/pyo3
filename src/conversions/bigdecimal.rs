@@ -53,6 +53,7 @@ use core::str::FromStr;
 
 #[cfg(feature = "experimental-inspect")]
 use crate::inspect::PyStaticExpr;
+use crate::sync::PerInterpreterCell;
 use crate::platform::prelude::*;
 #[cfg(feature = "experimental-inspect")]
 use crate::type_hint_identifier;
@@ -67,12 +68,12 @@ use bigdecimal::BigDecimal;
 use num_bigint::Sign;
 
 fn get_decimal_cls(py: Python<'_>) -> PyResult<&Bound<'_, PyType>> {
-    static DECIMAL_CLS: PyOnceLock<Py<PyType>> = PyOnceLock::new();
+    static DECIMAL_CLS: PerInterpreterCell<Py<PyType>> = PerInterpreterCell::new();
     DECIMAL_CLS.import(py, "decimal", "Decimal")
 }
 
 fn get_invalid_operation_error_cls(py: Python<'_>) -> PyResult<&Bound<'_, PyType>> {
-    static INVALID_OPERATION_CLS: PyOnceLock<Py<PyType>> = PyOnceLock::new();
+    static INVALID_OPERATION_CLS: PerInterpreterCell<Py<PyType>> = PerInterpreterCell::new();
     INVALID_OPERATION_CLS.import(py, "decimal", "InvalidOperation")
 }
 

@@ -50,6 +50,7 @@
 //! ```
 
 use crate::conversion::IntoPyObject;
+use crate::sync::PerInterpreterCell;
 use crate::exceptions::PyValueError;
 #[cfg(feature = "experimental-inspect")]
 use crate::inspect::PyStaticExpr;
@@ -84,7 +85,7 @@ impl FromPyObject<'_, '_> for Decimal {
     }
 }
 
-static DECIMAL_CLS: PyOnceLock<Py<PyType>> = PyOnceLock::new();
+static DECIMAL_CLS: PerInterpreterCell<Py<PyType>> = PerInterpreterCell::new();
 
 fn get_decimal_cls(py: Python<'_>) -> PyResult<&Bound<'_, PyType>> {
     DECIMAL_CLS.import(py, "decimal", "Decimal")

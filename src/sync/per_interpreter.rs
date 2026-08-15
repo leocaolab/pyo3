@@ -438,6 +438,32 @@ unsafe fn register_teardown_hook(interp_dict: *mut ffi::PyObject) {
     ffi::Py_DECREF(atexit);
 }
 
+impl<T> PerInterpreterCell<crate::Py<T>>
+where
+    T: crate::type_object::PyTypeCheck,
+{
+    /// This interpreter's `module_name.attr_name`, importing it here on first use.
+    ///
+    /// Per-interpreter because the imported object usually *is* per-interpreter: measured across
+    /// four sub-interpreters, `collections.abc.Sequence`, `decimal.Decimal`, `pathlib.Path`,
+    /// `uuid.UUID` and `zoneinfo.ZoneInfo` are five distinct heap types with ordinary refcounts —
+    /// one per interpreter. Caching one of them process-wide hands interpreter B an object owned
+    /// by interpreter A, which is the same defect this module exists to fix, one layer up.
+    pub fn import<'py>(
+        &self,
+        py: crate::Python<'py>,
+        module_name: &str,
+        attr_name: &str,
+    ) -> crate::PyResult<&crate::Bound<'py, T>> {
+        self.get_or_try_init(py, || {
+            use crate::types::any::PyAnyMethods;
+            let obj = py.import(module_name)?.getattr(attr_name)?.cast_into()?;
+            Ok(crate::Bound::unbind(obj))
+        })
+        .map(|v| v.bind(py))
+    }
+}
+
 // SAFETY: every access goes through a `Python<'_>` token, so it is serialised by the GIL of the
 // interpreter that owns the value, and values are never handed across interpreters.
 unsafe impl<T: Send> Send for PerInterpreterCell<T> {}

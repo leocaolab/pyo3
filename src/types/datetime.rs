@@ -5,6 +5,7 @@
 
 #[cfg(not(Py_LIMITED_API))]
 use crate::err::PyErr;
+use crate::sync::PerInterpreterCell;
 use crate::err::PyResult;
 #[cfg(not(Py_LIMITED_API))]
 use crate::ffi::{
@@ -751,7 +752,7 @@ impl PyTzInfo {
     where
         T: IntoPyObject<'py, Target = PyString>,
     {
-        static ZONE_INFO: PyOnceLock<Py<PyType>> = PyOnceLock::new();
+        static ZONE_INFO: PerInterpreterCell<Py<PyType>> = PerInterpreterCell::new();
 
         let zoneinfo = ZONE_INFO.import(py, "zoneinfo", "ZoneInfo");
 

@@ -1,6 +1,7 @@
 #![cfg(wip_feature_std)]
 
 use crate::conversion::IntoPyObject;
+use crate::sync::PerInterpreterCell;
 use crate::ffi_ptr_ext::FfiPtrExt;
 #[cfg(feature = "experimental-inspect")]
 use crate::inspect::{type_hint_identifier, type_hint_subscript, type_hint_union, PyStaticExpr};
@@ -42,7 +43,7 @@ impl<'py> IntoPyObject<'py> for &Path {
 
     #[inline]
     fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
-        static PY_PATH: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+        static PY_PATH: PerInterpreterCell<Py<PyAny>> = PerInterpreterCell::new();
         PY_PATH
             .import(py, "pathlib", "Path")?
             .call((self.as_os_str(),), None)

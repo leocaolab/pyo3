@@ -1,5 +1,6 @@
 use crate::conversion::IntoPyObject;
 use crate::exceptions::PyValueError;
+use crate::sync::PerInterpreterCell;
 #[cfg(feature = "experimental-inspect")]
 use crate::inspect::{type_hint_identifier, type_hint_union, PyStaticExpr};
 use crate::sync::PyOnceLock;
@@ -46,7 +47,7 @@ impl<'py> IntoPyObject<'py> for Ipv4Addr {
     const OUTPUT_TYPE: PyStaticExpr = type_hint_identifier!("ipaddress", "IPv4Address");
 
     fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
-        static IPV4_ADDRESS: PyOnceLock<Py<PyType>> = PyOnceLock::new();
+        static IPV4_ADDRESS: PerInterpreterCell<Py<PyType>> = PerInterpreterCell::new();
         IPV4_ADDRESS
             .import(py, "ipaddress", "IPv4Address")?
             .call1((u32::from_be_bytes(self.octets()),))
@@ -76,7 +77,7 @@ impl<'py> IntoPyObject<'py> for Ipv6Addr {
     const OUTPUT_TYPE: PyStaticExpr = type_hint_identifier!("ipaddress", "IPv6Address");
 
     fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
-        static IPV6_ADDRESS: PyOnceLock<Py<PyType>> = PyOnceLock::new();
+        static IPV6_ADDRESS: PerInterpreterCell<Py<PyType>> = PerInterpreterCell::new();
         IPV6_ADDRESS
             .import(py, "ipaddress", "IPv6Address")?
             .call1((u128::from_be_bytes(self.octets()),))

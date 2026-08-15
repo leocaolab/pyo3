@@ -66,6 +66,7 @@
 use uuid::{NonNilUuid, Uuid};
 
 use crate::conversion::IntoPyObject;
+use crate::sync::PerInterpreterCell;
 use crate::exceptions::{PyTypeError, PyValueError};
 #[cfg(feature = "experimental-inspect")]
 use crate::inspect::PyStaticExpr;
@@ -78,7 +79,7 @@ use crate::types::PyType;
 use crate::{intern, Borrowed, FromPyObject, Py, PyAny, PyErr, PyResult, Python};
 
 fn get_uuid_cls(py: Python<'_>) -> PyResult<&Bound<'_, PyType>> {
-    static UUID_CLS: PyOnceLock<Py<PyType>> = PyOnceLock::new();
+    static UUID_CLS: PerInterpreterCell<Py<PyType>> = PerInterpreterCell::new();
     UUID_CLS.import(py, "uuid", "UUID")
 }
 
