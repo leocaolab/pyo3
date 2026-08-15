@@ -12,6 +12,11 @@ edition = "2021"
 name = "abi3t"
 crate-type = ["cdylib"]
 
+[features]
+# 子模块走 wrap_pymodule! —— 父提交在那条路上会拒绝子解释器,于是它一开就把
+# 所有基准的对照列一起废掉。默认关,只有 submodule.py 打开它。
+submodule = []
+
 [dependencies]
 pyo3 = { version = "0.29", features = ["extension-module"] }
 

@@ -4,6 +4,7 @@
 //! Implementation details of `#[pymodule]` which need to be accessible from proc-macro generated code.
 #[allow(unused_imports, reason = "conditionally used")]
 use crate::platform::prelude::*;
+use crate::sync::PerInterpreterCell;
 use core::{
     cell::UnsafeCell,
     ffi::CStr,
@@ -15,14 +16,12 @@ use core::{
     not(any(PyPy, GraalPy)),
     not(all(windows, Py_LIMITED_API, not(Py_3_10))),
 ))]
-use core::sync::atomic::Ordering;
 
 #[cfg(all(
     not(any(PyPy, GraalPy)),
     not(all(windows, Py_LIMITED_API, not(Py_3_10))),
     target_has_atomic = "64",
 ))]
-use core::sync::atomic::AtomicI64;
 #[cfg(all(
     not(any(PyPy, GraalPy)),
     not(all(windows, Py_LIMITED_API, not(Py_3_10))),
@@ -31,6 +30,7 @@ use core::sync::atomic::AtomicI64;
 use portable_atomic::AtomicI64;
 
 #[cfg(not(any(PyPy, GraalPy)))]
+#[cfg(all(windows, Py_LIMITED_API, not(Py_3_10)))]
 use crate::exceptions::PyImportError;
 use crate::ffi_ptr_ext::FfiPtrExt;
 #[cfg(any(not(all(Py_LIMITED_API, Py_GIL_DISABLED)), Py_3_15))]
@@ -57,14 +57,11 @@ pub struct ModuleDef {
     name: &'static CStr,
     #[cfg(Py_3_15)]
     slots: &'static PyModuleSlots,
-    /// Interpreter ID where module was initialized (not applicable on PyPy).
-    #[cfg(all(
-        not(any(PyPy, GraalPy)),
-        not(all(windows, Py_LIMITED_API, not(Py_3_10)))
-    ))]
-    interpreter: AtomicI64,
     /// Initialized module object, cached to avoid reinitialization.
-    module: PyOnceLock<Py<PyModule>>,
+    ///
+    /// Per-interpreter. A `Py<PyModule>` belongs to the interpreter that created it, and caching
+    /// one per process is what forced `make_module` to refuse every interpreter after the first.
+    module: PerInterpreterCell<Py<PyModule>>,
 }
 
 unsafe impl Sync for ModuleDef {}
@@ -108,13 +105,7 @@ impl ModuleDef {
             name,
             #[cfg(Py_3_15)]
             slots,
-            // -1 is never expected to be a valid interpreter ID
-            #[cfg(all(
-                not(any(PyPy, GraalPy)),
-                not(all(windows, Py_LIMITED_API, not(Py_3_10)))
-            ))]
-            interpreter: AtomicI64::new(-1),
-            module: PyOnceLock::new(),
+            module: PerInterpreterCell::new(),
         }
     }
 
@@ -125,35 +116,13 @@ impl ModuleDef {
 
     /// Builds a module object directly. Used for [`#[pymodule]`][crate::pymodule] submodules.
     pub fn make_module(&'static self, py: Python<'_>) -> PyResult<Py<PyModule>> {
-        // Check the interpreter ID has not changed, since we currently have no way to guarantee
-        // that static data is not reused across interpreters.
-        //
-        // PyPy does not have subinterpreters, so no need to check interpreter ID.
-        //
-        // TODO: it should be possible to use the Py_mod_multiple_interpreters slot on sufficiently
-        // new Python versions to remove the need for this custom logic
+        // The cached module object is now per-interpreter, so a second interpreter no longer
+        // observes the first one's module and there is nothing to refuse. See pyo3#576.
         #[cfg(not(any(PyPy, GraalPy)))]
         {
-            // PyInterpreterState_Get is missing from python3.dll for Windows
-            // stable API on 3.9
-            #[cfg(not(all(windows, Py_LIMITED_API, not(Py_3_10))))]
-            {
-                let current_interpreter =
-                    unsafe { ffi::PyInterpreterState_GetID(ffi::PyInterpreterState_Get()) };
-                crate::err::error_on_minusone(py, current_interpreter)?;
-                if let Err(initialized_interpreter) = self.interpreter.compare_exchange(
-                    -1,
-                    current_interpreter,
-                    Ordering::SeqCst,
-                    Ordering::SeqCst,
-                ) {
-                    if initialized_interpreter != current_interpreter {
-                        return Err(PyImportError::new_err(
-                            "PyO3 modules do not yet support subinterpreters, see https://github.com/PyO3/pyo3/issues/576",
-                        ));
-                    }
-                }
-            }
+            // `PerInterpreterCell` needs `PyInterpreterState_Get`, which is missing from
+            // python3.dll for the Windows stable API on 3.9; there, fall back to refusing a
+            // second initialization outright.
             #[cfg(all(windows, Py_LIMITED_API, not(Py_3_10)))]
             {
                 // The Windows stable API before 3.10 cannot check the interpreter ID, so best that

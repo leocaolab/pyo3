@@ -1,4 +1,6 @@
 use pyo3::prelude::*;
+#[cfg(feature = "submodule")]
+use pyo3::wrap_pymodule;
 use pyo3::buffer::PyBuffer;
 
 /// 纯空调用:隔离框架的每次调用开销
@@ -97,7 +99,19 @@ static RAW_NOOP: RawDef = RawDef(pyo3::ffi::PyMethodDef {
     ml_doc: core::ptr::null(),
 });
 
+/// 子模块 —— 走 wrap_pymodule! / ModuleDef::make_module 那条路。
+/// 上游在这里有个守卫:第二个子解释器 import 会抛
+/// "PyO3 modules do not yet support subinterpreters"。
+#[cfg(feature = "submodule")]
+#[pymodule] fn inner(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add("answer", 42i64)?;
+    m.add_class::<Row>()?;
+    Ok(())
+}
+
 #[pymodule] fn abi3t(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    #[cfg(feature = "submodule")]
+    m.add_wrapped(wrap_pymodule!(inner))?;
     unsafe {
         let f = pyo3::ffi::PyCFunction_NewEx(
             &RAW_NOOP.0 as *const _ as *mut _,
