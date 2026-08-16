@@ -247,6 +247,21 @@ type PyObjVec = Vec<(*mut ffi::PyInterpreterState, NonNull<ffi::PyObject>)>;
 
 #[cfg(not(pyo3_disable_reference_pool))]
 /// Thread-safe storage for objects which were dec_ref while not attached.
+///
+/// ★ 下面这套按解释器分拣的逻辑**无效,而且从未执行过一次**。
+///
+/// 它靠 `current_interpreter_or_null` 在 `register_decref` 里读归属,而那个探针在
+/// 真实触发场景(tokio / rayon worker)上一律返回 NULL —— 那些线程没经过
+/// `PyGILState_Ensure`,GILState 的 TSS 是空的。于是 `first_interp` 永远填不上、
+/// `multiple_seen` 永远是 false、分拣分支一行都跑不到:打了这个补丁的二进制在这条
+/// 路径上和没打**逐字节等价**,复现照崩(10/10 SIGABRT,崩溃瞬间读内存
+/// `multiple_seen = 0`)。
+///
+/// 方向上就答不出来:归属在 drop 那一刻取不到,**因为那一刻线程没有 thread state,
+/// 而那正是对象进池子的原因**。真修法要么让 `Py<T>` 在诞生时带上解释器,要么把池子
+/// 按解释器分开 —— 两者都要求归属在入池之前已经在手上。
+///
+/// 背景、复现步骤、证据:`subinterp-bench/BUG-POOL.md`。
 struct ReferencePool {
     // Whether any decrefs are (or may be) pending. The `Mutex` performs
     // synchronization so we can use `Relaxed` ordering for all operations

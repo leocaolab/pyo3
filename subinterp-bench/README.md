@@ -15,11 +15,16 @@ single.py     单线程热路径:确认改动没有在无争用时收费
 leak.py       串行建/关 N 个解释器,看 RSS 斜率        ← ★ 抓到过一个 2.6MB/解释器 的泄漏
 reclaim.py    一批解释器关闭后立刻收回多少
 stress.py     长跑:隔离 / 结果正确性 / 存活
+pool_soak.py  N 个解释器同时敲全局 ReferencePool                ← ★ 复现一个【未修复】的 bug
 
 METHOD.md     测量纪律 —— 改基准前先看
 POLARS.md     polars 在子解释器里的完整实测记录
 POLARS-PATCH.md  给 polars 的补丁:回调回正确的解释器
+BUG-POOL.md   全局 ReferencePool 的跨解释器 decref:背景、复现、以及一次失败的修复
 ```
+
+> **`BUG-POOL.md` 记的是一个还没修好的 bug。** 提交 `73f61bb` 声称修了它,没修 ——
+> 它的分拣分支在复现里一次都没执行过。看到那段代码不要以为这块处理过了。
 
 `leak.py` 和 `reclaim.py` 问的**不是同一件事**,两个都要跑:前者一次只活一个解释器、
 做上千次,斜率不为零就是真泄漏;后者一次建 16 个再一起关,只能看出立刻收回了多少,
