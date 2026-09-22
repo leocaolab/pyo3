@@ -294,14 +294,17 @@ Evidence (3.14.7 macOS):
 - `attach_cost.py` (ns per `#[pyfunction]` call): idle 10.2 (upstream 10.9); with another interpreter's pool dirty 13.1 (upstream 10.6, but upstream's number is what it costs to wrongly drain that pool on the first call).
 - `leak.py` 300 rounds, before vs after M3.2: 0.2 vs 0.2–0.3 MB per thousand interpreters. Unchanged.
 - polars bug B and the write check on the new build: unchanged (80/80; copies 16/16).
-- Not yet run: ASAN on Linux.
+- **Linux** (bluewhale, 3.14.4): 860 unit tests; `pool_probe.py` identical to macOS (upstream shared .so: other interpreter applies the decref 5/5 on both paths; fork 0/5); `attach_probe`, `cache_probe`, `conv_probe` identical verdicts. Per-read costs are higher there (`intern!` 7.7 ns, `PyOnceLock::get` 3.4 ns vs upstream 0.96; host load ≈28; dylib TLS goes through `__tls_get_addr`). Looked at again in M5.
+- **ASAN** (Linux, probe built with `-Zsanitizer=address`, `PYTHONMALLOC=malloc`): 0 reports for the fork **and 0 for upstream**, although upstream's wrong-interpreter decref is real (`pool_probe` 5/5). ASAN cannot see this class of bug: the damage is a free into another interpreter's obmalloc arena, which is not malloc, and an unsynchronised refcount write, which is a race. So the acceptance evidence for M3.2 is `pool_probe.py`, which checks who applied the decref and does not depend on the allocator. The ASAN run only shows the fork adds no malloc-level memory errors.
 
 ### M3 acceptance
 
 - `subinterp-bench/pool_soak.py` at N = 8, write mode: 10/10 clean on macOS
   (was 6/6 SIGABRT).
 - The same under ASAN on Linux: 0 reports (glibc does not abort, so "no crash"
-  is not evidence).
+  is not evidence). *Revised after running it: ASAN cannot see this bug (upstream
+  also reports 0); `pool_probe.py`, which checks who applied the decref, is the
+  allocator-independent evidence. See "M3 status".*
 - N = 1 control unchanged; `leak.py` slope unchanged.
 
 ---
