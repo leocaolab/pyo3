@@ -120,9 +120,11 @@ static RAW_NOOP: RawDef = RawDef(pyo3::ffi::PyMethodDef {
 // 手写两个裸 C 类型,除了 GC 标志之外完全一样。和 PyO3 的 #[pyclass] 并排跑,
 // 就能把「GC 跟踪的钱」和「PyO3 包装层的钱」分开,而不是笼统说「慢 17%」。
 
+#[cfg(not(feature = "abi3"))] // raw type slots are not in the limited API
 #[repr(C)]
 struct RawRow { ob_base: pyo3::ffi::PyObject, a: f64, b: i64 }
 
+#[cfg(not(feature = "abi3"))] // raw type slots are not in the limited API
 unsafe extern "C" fn rawrow_new(
     subtype: *mut pyo3::ffi::PyTypeObject,
     _args: *mut pyo3::ffi::PyObject,
@@ -138,6 +140,7 @@ unsafe extern "C" fn rawrow_new(
     obj
 }
 
+#[cfg(not(feature = "abi3"))] // raw type slots are not in the limited API
 unsafe extern "C" fn rawrow_dealloc(obj: *mut pyo3::ffi::PyObject) {
     let ty = pyo3::ffi::Py_TYPE(obj);
     if (pyo3::ffi::PyType_GetFlags(ty) & pyo3::ffi::Py_TPFLAGS_HAVE_GC) != 0 {
@@ -148,12 +151,14 @@ unsafe extern "C" fn rawrow_dealloc(obj: *mut pyo3::ffi::PyObject) {
     pyo3::ffi::Py_DECREF(ty as *mut pyo3::ffi::PyObject);
 }
 
+#[cfg(not(feature = "abi3"))] // raw type slots are not in the limited API
 unsafe extern "C" fn rawrow_traverse(
     _o: *mut pyo3::ffi::PyObject,
     _v: pyo3::ffi::visitproc,
     _a: *mut core::ffi::c_void,
 ) -> core::ffi::c_int { 0 }
 
+#[cfg(not(feature = "abi3"))] // raw type slots are not in the limited API
 unsafe fn make_raw_type(name: *const core::ffi::c_char, with_gc: bool) -> *mut pyo3::ffi::PyObject {
     let mut slots = vec![
         pyo3::ffi::PyType_Slot { slot: pyo3::ffi::Py_tp_new, pfunc: rawrow_new as *mut _ },
@@ -175,6 +180,106 @@ unsafe fn make_raw_type(name: *const core::ffi::c_char, with_gc: bool) -> *mut p
     pyo3::ffi::PyType_FromSpec(&spec as *const _ as *mut _)
 }
 
+
+// ── M1.1: where does a Python::attach land? ──────────────────────────────
+// Only APIs present in both upstream and the fork, so the same probe measures
+// both. Each function returns interpreter ids; -2 means the attach panicked
+// (a loud failure), which is reported, not hidden.
+
+#[cfg(not(feature = "abi3"))]
+fn interp_id() -> i64 {
+    unsafe { pyo3::ffi::PyInterpreterState_GetID(pyo3::ffi::PyInterpreterState_Get()) }
+}
+
+/// The interpreter this call runs in.
+#[cfg(not(feature = "abi3"))]
+#[pyfunction]
+fn current_interp_id(_py: Python<'_>) -> i64 {
+    interp_id()
+}
+
+/// Pointer to the current interpreter, so a native thread can attach to it.
+#[cfg(not(feature = "abi3"))]
+#[pyfunction]
+fn interp_ptr(_py: Python<'_>) -> usize {
+    unsafe { pyo3::ffi::PyInterpreterState_Get() as usize }
+}
+
+/// After `py.detach`, a nested `Python::attach` on the same thread.
+#[cfg(not(feature = "abi3"))]
+#[pyfunction]
+fn attach_after_detach(py: Python<'_>) -> i64 {
+    py.detach(|| {
+        std::panic::catch_unwind(|| Python::attach(|_py| interp_id())).unwrap_or(-2)
+    })
+}
+
+/// `Python::attach` on a fresh OS thread that has never had a thread state.
+#[cfg(not(feature = "abi3"))]
+#[pyfunction]
+fn attach_on_new_thread(py: Python<'_>) -> i64 {
+    py.detach(|| {
+        std::thread::spawn(|| Python::attach(|_py| interp_id()))
+            .join()
+            .unwrap_or(-2)
+    })
+}
+
+/// Pyronova-style worker: a native thread whose FIRST thread state belongs to
+/// the interpreter at `ptr`. Returns (expected, after_detach, new_thread).
+#[cfg(not(feature = "abi3"))]
+#[pyfunction]
+fn probe_on_native_thread(py: Python<'_>, ptr: usize) -> (i64, i64, i64) {
+    py.detach(move || {
+        std::thread::spawn(move || unsafe {
+            use pyo3::ffi;
+            let tstate = ffi::PyThreadState_New(ptr as *mut ffi::PyInterpreterState);
+            ffi::PyEval_RestoreThread(tstate);
+            let r = std::panic::catch_unwind(|| {
+                Python::attach(|py| {
+                    let expected = interp_id();
+                    let after = py.detach(|| {
+                        std::panic::catch_unwind(|| Python::attach(|_py| interp_id()))
+                            .unwrap_or(-2)
+                    });
+                    let fresh = py.detach(|| {
+                        std::thread::spawn(|| Python::attach(|_py| interp_id()))
+                            .join()
+                            .unwrap_or(-2)
+                    });
+                    (expected, after, fresh)
+                })
+            })
+            .unwrap_or((-2, -2, -2));
+            ffi::PyThreadState_Clear(tstate);
+            ffi::PyThreadState_DeleteCurrent();
+            r
+        })
+        .join()
+        .unwrap_or((-2, -2, -2))
+    })
+}
+
+
+/// ns per `Python::attach` from a single foreign thread (no thread state), n times.
+#[cfg(not(feature = "abi3"))]
+#[pyfunction]
+fn foreign_attach_ns(py: Python<'_>, n: u64) -> f64 {
+    py.detach(move || {
+        std::thread::spawn(move || {
+            let t = std::time::Instant::now();
+            let mut acc = 0i64;
+            for _ in 0..n {
+                acc = acc.wrapping_add(Python::attach(|_py| 1i64));
+            }
+            std::hint::black_box(acc);
+            t.elapsed().as_nanos() as f64 / n as f64
+        })
+        .join()
+        .unwrap_or(-2.0)
+    })
+}
+
 #[pymodule] fn abi3t(m: &Bound<'_, PyModule>) -> PyResult<()> {
     #[cfg(feature = "submodule")]
     m.add_wrapped(wrap_pymodule!(inner))?;
@@ -188,12 +293,22 @@ unsafe fn make_raw_type(name: *const core::ffi::c_char, with_gc: bool) -> *mut p
         m.add("raw_noop", Bound::from_owned_ptr(m.py(), f))?;
     }
     m.add_function(wrap_pyfunction!(interp_id_ns, m)?)?;
+    #[cfg(not(feature = "abi3"))]
+    {
+        m.add_function(wrap_pyfunction!(current_interp_id, m)?)?;
+        m.add_function(wrap_pyfunction!(interp_ptr, m)?)?;
+        m.add_function(wrap_pyfunction!(attach_after_detach, m)?)?;
+        m.add_function(wrap_pyfunction!(attach_on_new_thread, m)?)?;
+        m.add_function(wrap_pyfunction!(probe_on_native_thread, m)?)?;
+        m.add_function(wrap_pyfunction!(foreign_attach_ns, m)?)?;
+    }
     m.add_function(wrap_pyfunction!(type_lookup_ns, m)?)?;
     m.add_function(wrap_pyfunction!(noop, m)?)?;
     #[cfg(not(feature = "abi3"))]
     m.add_function(wrap_pyfunction!(sum_buf, m)?)?;
     m.add_class::<Row>()?;
     m.add_class::<Counter>()?;
+    #[cfg(not(feature = "abi3"))]
     unsafe {
         let t1 = make_raw_type(c"RawRowNoGC".as_ptr(), false);
         if t1.is_null() { return Err(PyErr::fetch(m.py())); }
