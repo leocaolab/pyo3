@@ -26,8 +26,8 @@ shared polars) needs M1–M4.
 
 | id | problem | where | severity |
 |---|---|---|---|
-| P3-foreign | `Python::attach` on a thread with no thread state calls `PyGILState_Ensure`, which binds the **main** interpreter | `src/internal/state.rs:158` (`do_attach_unchecked`) | runs another interpreter's objects under the main GIL; aborts or corrupts |
-| P3-reattach | after `py.detach`, a nested `Python::attach` on the **same** thread also goes through `PyGILState_Ensure`; correct only if CPython's gilstate slot for that OS thread is bound to the sub-interpreter's thread state | same | **unverified**: likely wrong for threads first created by the main interpreter |
+| P3-foreign | `Python::attach` on a thread with no thread state calls `PyGILState_Ensure`, which binds the **main** interpreter | `src/internal/state.rs` (`do_attach_unchecked`) | **fixed (M1.3, `5fec073`)**: home interpreter for single-interpreter copies, loud failure for shared ones |
+| P3-reattach | after `py.detach`, a nested `Python::attach` on the **same** thread also goes through `PyGILState_Ensure` | same | **measured correct on 3.14** for both thread origins (#2); 3.12 / 3.13 not yet measured |
 | P1 | `PyOnceLock` is one process-global `OnceCell` | `src/sync/once_lock.rs` | first interpreter's object handed to all (polars bug B; rust-numpy API table) |
 | P2 | `intern!` / `Interned` hold a process-global `PyOnceLock<Py<PyString>>` | `src/sync.rs:237-246` | interned strings are **mortal** on 3.12–3.14 (measured), so their refcount is shared |
 | A | process-global deferred-decref pool; drained by whichever interpreter attaches next | `src/internal/state.rs:265-388` | SIGABRT in 1–4 s at ≥4 interpreters with callbacks; silent heap corruption on Linux |
@@ -106,6 +106,14 @@ Thread-state cost: `PyThreadState_New` + delete per foreign attach. Measure
 first. If needed, cache one thread state per (OS thread, HOME) in TLS,
 invalidated by the per-interpreter teardown hook's generation bump
 (`src/sync/per_interpreter.rs`, `GENERATION`).
+
+### M1 status (2026-09-22)
+
+| item | result |
+|---|---|
+| M1.1 probe (#2) | done. Re-attach after `py.detach`: correct in all 8 combinations. Fresh thread: MAIN in all 8, upstream and branch |
+| M1.2 detached-tstate slot (#3) | not needed on 3.14 (M1.1). Open until 3.12 / 3.13 are measured |
+| M1.3 home interpreter (#4) | done (`5fec073`). Fresh thread: copies → correct 8/8, shared → loud 8/8. `matrix.py` unchanged. 860 unit tests. Foreign attach 80 ns (upstream 65 ns, wrong interpreter). **Open:** polars write-path re-check |
 
 ### M1 acceptance
 
