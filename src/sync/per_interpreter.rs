@@ -261,12 +261,7 @@ unsafe fn lookup_registry_slow(
         return None;
     }
     let registry = &*registry;
-    let entry = (
-        interp,
-        generation,
-        registry.slots.as_ptr(),
-        registry.slots.len(),
-    );
+    let entry = (interp, generation, registry.slots.as_ptr(), registry.slots.len());
     CACHE.with(|c| c.set(entry));
     Some((entry.2, entry.3))
 }
@@ -367,11 +362,7 @@ unsafe extern "C" fn teardown(
             for _ in 0..3 {
                 // `PyObject_CallMethodNoArgs` 不在限定 API 里(polars 这类 abi3 构建会编不过),
                 // `PyObject_CallMethodObjArgs` 在。它是变参,以 NULL 结尾。
-                let r = ffi::PyObject_CallMethodObjArgs(
-                    gc,
-                    name,
-                    core::ptr::null_mut::<ffi::PyObject>(),
-                );
+                let r = ffi::PyObject_CallMethodObjArgs(gc, name, core::ptr::null_mut::<ffi::PyObject>());
                 if r.is_null() {
                     ffi::PyErr_Clear();
                     break;
