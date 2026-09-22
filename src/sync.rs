@@ -242,13 +242,20 @@ macro_rules! intern {
 }
 
 /// Implementation detail for `intern!` macro.
+///
+/// Holds one interned `str` **per interpreter**. An interned string is an
+/// ordinary, mortal object on CPython 3.12-3.14 (measured: not immortal, normal
+/// refcount), so a single process-wide one would be shared by every
+/// sub-interpreter, with its refcount mutated under different GILs.
+/// `intern!` always declares this as a `static`, which is what
+/// [`PerInterpreterCell`] is built for.
 #[doc(hidden)]
-pub struct Interned(&'static str, PyOnceLock<Py<PyString>>);
+pub struct Interned(&'static str, PerInterpreterCell<Py<PyString>>);
 
 impl Interned {
     /// Creates an empty holder for an interned `str`.
     pub const fn new(value: &'static str) -> Self {
-        Interned(value, PyOnceLock::new())
+        Interned(value, PerInterpreterCell::new())
     }
 
     /// Gets or creates the interned `str` value.

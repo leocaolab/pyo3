@@ -280,6 +280,35 @@ fn foreign_attach_ns(py: Python<'_>, n: u64) -> f64 {
     })
 }
 
+
+// ── M2: per-interpreter caches ───────────────────────────────────────────
+
+/// Address of the `str` object that `intern!` returns here. Per interpreter it
+/// must be a different object (interned strings are mortal on 3.12-3.14).
+#[pyfunction]
+fn interned_ptr(py: Python<'_>) -> usize {
+    pyo3::intern!(py, "subinterp_probe_interned_key").as_ptr() as usize
+}
+
+/// Interpreter id of the thread calling this (to pair with the pointers above).
+#[pyfunction]
+fn this_interp_id(_py: Python<'_>) -> i64 {
+    unsafe { pyo3::ffi::PyInterpreterState_GetID(pyo3::ffi::PyInterpreterState_Get()) }
+}
+
+/// ns per `intern!` lookup after the first, n times.
+#[pyfunction]
+fn intern_ns(py: Python<'_>, n: u64) -> f64 {
+    let _ = pyo3::intern!(py, "subinterp_probe_intern_bench");
+    let t = std::time::Instant::now();
+    let mut acc = 0usize;
+    for _ in 0..n {
+        acc = acc.wrapping_add(pyo3::intern!(py, "subinterp_probe_intern_bench").as_ptr() as usize);
+    }
+    std::hint::black_box(acc);
+    t.elapsed().as_nanos() as f64 / n as f64
+}
+
 #[pymodule] fn abi3t(m: &Bound<'_, PyModule>) -> PyResult<()> {
     #[cfg(feature = "submodule")]
     m.add_wrapped(wrap_pymodule!(inner))?;
@@ -293,6 +322,9 @@ fn foreign_attach_ns(py: Python<'_>, n: u64) -> f64 {
         m.add("raw_noop", Bound::from_owned_ptr(m.py(), f))?;
     }
     m.add_function(wrap_pyfunction!(interp_id_ns, m)?)?;
+    m.add_function(wrap_pyfunction!(interned_ptr, m)?)?;
+    m.add_function(wrap_pyfunction!(this_interp_id, m)?)?;
+    m.add_function(wrap_pyfunction!(intern_ns, m)?)?;
     #[cfg(not(feature = "abi3"))]
     {
         m.add_function(wrap_pyfunction!(current_interp_id, m)?)?;
