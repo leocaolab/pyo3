@@ -113,7 +113,7 @@ invalidated by the per-interpreter teardown hook's generation bump
 |---|---|
 | M1.1 probe (#2) | done. Re-attach after `py.detach`: correct in all 8 combinations. Fresh thread: MAIN in all 8, upstream and branch |
 | M1.2 detached-tstate slot (#3) | **not needed**: re-attach is correct on 3.12, 3.13 and 3.14, so no code was added |
-| M1.3 home interpreter (#4) | done (`5fec073`). Fresh thread: copies → correct, shared → loud, on 3.12 / 3.13 / 3.14 (macOS) and 3.14 (Linux). `matrix.py` unchanged on both OSes. 860 unit tests on both. Foreign attach 80 ns (upstream 65 ns, wrong interpreter). **Open:** polars write-path re-check |
+| M1.3 home interpreter (#4) | done (`5fec073`). Fresh thread: copies → correct, shared → loud, on 3.12 / 3.13 / 3.14 (macOS) and 3.14 (Linux). `matrix.py` unchanged on both OSes. 860 unit tests on both. Foreign attach 80 ns (upstream 65 ns, wrong interpreter). **polars (unpatched) write-path check:** copies 16/16 writes in the owning interpreter; shared → loud panic, turned into a crash by polars' own `unwrap` (`polars_write_check.py`) |
 
 ### M1 acceptance
 
