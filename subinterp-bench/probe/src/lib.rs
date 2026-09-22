@@ -346,6 +346,40 @@ fn once_lock_ns(py: Python<'_>, n: u64) -> f64 {
     t.elapsed().as_nanos() as f64 / n as f64
 }
 
+/// M2.3 (#7): conversions that go through PyO3's process-level caches. Python checks each
+/// result against its own interpreter's class (`type(r) is pathlib.Path`, ...).
+#[pyfunction]
+fn conv_path() -> std::path::PathBuf {
+    std::path::PathBuf::from("/tmp/probe")
+}
+
+#[pyfunction]
+fn conv_ip() -> std::net::Ipv4Addr {
+    std::net::Ipv4Addr::new(127, 0, 0, 1)
+}
+
+#[pyfunction]
+fn conv_delta() -> std::time::Duration {
+    std::time::Duration::from_secs(90)
+}
+
+#[pyfunction]
+fn conv_utc(py: Python<'_>) -> PyResult<Bound<'_, pyo3::types::PyTzInfo>> {
+    pyo3::types::PyTzInfo::utc(py).map(|b| b.to_owned())
+}
+
+/// (PyO3's cached datetime C-API table, a fresh `PyCapsule_Import` in this interpreter).
+#[cfg(not(feature = "abi3"))]
+#[pyfunction]
+fn datetime_capi(py: Python<'_>) -> (usize, usize) {
+    let _ = pyo3::types::PyDelta::new(py, 0, 0, 0, false); // makes PyO3 import the table
+    unsafe {
+        let cached = pyo3::ffi::PyDateTimeAPI() as usize;
+        let fresh = pyo3::ffi::PyCapsule_Import(pyo3::ffi::PyDateTime_CAPSULE_NAME.as_ptr(), 1) as usize;
+        (cached, fresh)
+    }
+}
+
 #[pymodule] fn abi3t(m: &Bound<'_, PyModule>) -> PyResult<()> {
     #[cfg(feature = "submodule")]
     m.add_wrapped(wrap_pymodule!(inner))?;
@@ -365,6 +399,12 @@ fn once_lock_ns(py: Python<'_>, n: u64) -> f64 {
     m.add_function(wrap_pyfunction!(once_lock_sys_ptr, m)?)?;
     m.add_function(wrap_pyfunction!(once_lock_heap_check, m)?)?;
     m.add_function(wrap_pyfunction!(once_lock_ns, m)?)?;
+    m.add_function(wrap_pyfunction!(conv_path, m)?)?;
+    m.add_function(wrap_pyfunction!(conv_ip, m)?)?;
+    m.add_function(wrap_pyfunction!(conv_delta, m)?)?;
+    m.add_function(wrap_pyfunction!(conv_utc, m)?)?;
+    #[cfg(not(feature = "abi3"))]
+    m.add_function(wrap_pyfunction!(datetime_capi, m)?)?;
     #[cfg(not(feature = "abi3"))]
     {
         m.add_function(wrap_pyfunction!(current_interp_id, m)?)?;
