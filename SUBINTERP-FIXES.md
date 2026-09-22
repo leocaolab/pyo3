@@ -278,7 +278,7 @@ that interpreter's teardown hook.
 | M3.1 dead code (#9) | done (`2a9c032`). The pool is byte-identical to upstream again, the base for M3.2 |
 | M3.2 per-interpreter pools (#10) | done. One pool per interpreter in `POOLS`, keyed by interpreter (the main interpreter under a fixed key). The owner is fixed at enqueue (`owner_now`): the thread's thread state, else HOME (M1.3), else unknown. A pool is drained only by an attach to its own interpreter, and emptied by that interpreter's teardown hook (under `AssumeAttached`). Fast path: one global dirty-pool counter, so an idle attach costs what upstream's does |
 | unknown owner | panics with an explanation, like `AttachError`. **While the thread is already panicking** (the drop is fallout of an attach that just failed loudly), it prints the reason and leaks the object instead: a second panic would abort, and that was measured turning `pool_soak.py` shared from a Python `PanicException` into exit 134 |
-| M3.3 policy (#11) | open: fail-loudly is implemented; the `Py<T>`-carries-interpreter layout option is not prototyped |
+| M3.3 policy (#11) | **decided (2026-09-22): fail loudly, no layout option.** An unknown owner exists only for a shared copy dropping on a foreign thread. The north-star route (Pyronova copies) always knows the owner through HOME, and in the shared configuration the attach on that same thread already fails loudly (M1.3). A 16-byte `Py<T>` would change the layout for every PyO3 user and buy nothing here |
 
 Evidence (3.14.7 macOS):
 
@@ -354,6 +354,13 @@ measurement exactly. What can be measured:
   exists. The same loop with the probe extension (`leak.py`) grows 0.2 KB per interpreter,
   so PyO3's own per-interpreter machinery is not where 52 KB goes. Attribution between
   polars' per-import state and CPython's own per-interpreter retention is still open.
+
+**Decided (2026-09-22): acceptance revised, #13 closed.** The original criteria compared
+against an upstream that cannot load. The revised criteria, both met: import cost within
+1.2× of upstream in the main interpreter (1.02×), and PyO3's own per-interpreter slope at
+the probe's level (`leak.py` 0.2 KB per interpreter, unchanged across M3.2). Pyronova's
+workers live as long as the process, so 52 KB per interpreter lifetime is not on the
+north-star path. Where the 52 KB goes is not investigated.
 
 ## M5 — Upstream readiness
 
