@@ -320,6 +320,41 @@ Evidence (3.14.7 macOS):
   legacy config, A/B against the parent commit). Acceptance: the slope is
   within 10% of upstream, and import time within 1.2× of upstream.
 
+### M4 status (2026-09-22)
+
+**C (#12), the crash when sub-interpreters are destroyed after polars work. Measured, and attributed to M2.2, not to the import.**
+`teardown_check.py`: N own-GIL sub-interpreters each import polars and work, then all are closed.
+
+| polars built with | teardown imports `gc` | `writefile`, N=8, shared, 10 rounds | `compute`, N=8 |
+|---|---|---|---|
+| M1.3-era fork (`5fec073`) | yes | **5/10 clean, 5 segfaults** | 10/10 |
+| M2.2 (`03eabbd`) | yes | 10/10 | 10/10 |
+| M4.1 (this change) | no | 10/10 | 10/10 |
+
+Current build, every cell 3/3 clean: import / frame / compute / writefile × N=2,4,8 × shared and copies.
+The crash went away with M2.2 while the import was still there. So the cause was the
+process-global `PyOnceLock` values (the first interpreter's objects, used by the others
+after that interpreter was destroyed), not the import. M4.1 still removes the import:
+`gc.collect` is resolved when the hook is registered and stored in the interpreter dict,
+and the hook only calls it. Importing mid-`Py_EndInterpreter` is a risk with no benefit.
+
+**D (#13), the ~60 KB per interpreter and 3.7× import cost. The original baseline was invalid.**
+Upstream PyO3 refuses to load in any sub-interpreter, legacy config included
+(`ImportError: PyO3 modules do not yet support subinterpreters`, on the first round of
+`polars_leak.py`). So the recorded "upstream: flat, 7.1 s" was an interpreter whose
+import failed every round. The comparison was "polars loaded" against "polars not loaded".
+The method was never written down, so this is an inference, but it matches the
+measurement exactly. What can be measured:
+
+- import cost, main interpreter, same polars source with upstream vs fork PyO3
+  (`import polars` + one `write_csv`, median of 9 processes, 2 runs): 56.6 / 57.9 ms
+  upstream vs 57.5 / 59.1 ms fork, **≈1.02×**. There is no 3.7× import cost.
+- per-interpreter-lifetime RSS, fork only (`polars_leak.py`, legacy, 300 rounds):
+  +52 KB per round in the second half, 45 ms per import+write. No upstream baseline
+  exists. The same loop with the probe extension (`leak.py`) grows 0.2 KB per interpreter,
+  so PyO3's own per-interpreter machinery is not where 52 KB goes. Attribution between
+  polars' per-import state and CPython's own per-interpreter retention is still open.
+
 ## M5 — Upstream readiness
 
 - CI on the fork (public, so Actions are free): `cargo test --lib --release`,

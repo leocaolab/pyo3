@@ -46,6 +46,10 @@ const CAPSULE_NAME: &CStr = c"pyo3.per_interpreter.registry";
 /// Marks that this interpreter's teardown hook has been registered.
 const HOOK_KEY: &CStr = c"_pyo3_per_interpreter_hook";
 
+/// `gc.collect`, resolved when the hook is registered, so the hook itself imports nothing while
+/// `Py_EndInterpreter` is tearing the interpreter down (M4.1, #12).
+const GC_COLLECT_KEY: &CStr = c"_pyo3_per_interpreter_gc_collect";
+
 /// Hands out one index per cell — one per `#[pyclass]` or `create_exception!` in the program,
 /// assigned in first-use order.
 static NEXT_INDEX: AtomicUsize = AtomicUsize::new(0);
@@ -459,25 +463,20 @@ unsafe extern "C" fn teardown(
         // Three passes, not one: collecting a type object makes what it referenced unreachable in
         // turn, and that is only seen on the next pass. One pass recovered 25% of the excess,
         // three recover all of it.
-        let gc = ffi::PyImport_ImportModule(c"gc".as_ptr());
-        if !gc.is_null() {
-            let name = ffi::PyUnicode_FromString(c"collect".as_ptr());
+        //
+        // `gc.collect` was stored when the hook was registered: no import here, mid-teardown.
+        let collect = ffi::PyDict_GetItemString(interp_dict, GC_COLLECT_KEY.as_ptr());
+        if !collect.is_null() {
+            ffi::Py_INCREF(collect);
             for _ in 0..3 {
-                // `PyObject_CallMethodNoArgs` 不在限定 API 里(polars 这类 abi3 构建会编不过),
-                // `PyObject_CallMethodObjArgs` 在。它是变参,以 NULL 结尾。
-                let r = ffi::PyObject_CallMethodObjArgs(gc, name, core::ptr::null_mut::<ffi::PyObject>());
+                let r = ffi::PyObject_CallObject(collect, core::ptr::null_mut());
                 if r.is_null() {
                     ffi::PyErr_Clear();
                     break;
                 }
                 ffi::Py_DECREF(r);
             }
-            if !name.is_null() {
-                ffi::Py_DECREF(name);
-            }
-            ffi::Py_DECREF(gc);
-        } else {
-            ffi::PyErr_Clear();
+            ffi::Py_DECREF(collect);
         }
     }
     ffi::Py_INCREF(ffi::Py_None());
@@ -538,6 +537,22 @@ unsafe fn register_teardown_hook(interp_dict: *mut ffi::PyObject) {
     }
     if ffi::PyDict_SetItemString(interp_dict, HOOK_KEY.as_ptr(), callable) < 0 {
         ffi::PyErr_Clear();
+    }
+    // Resolve `gc.collect` now, while the interpreter is healthy; the hook only calls it.
+    let gc = ffi::PyImport_ImportModule(c"gc".as_ptr());
+    if gc.is_null() {
+        ffi::PyErr_Clear();
+    } else {
+        let collect = ffi::PyObject_GetAttrString(gc, c"collect".as_ptr());
+        if collect.is_null() {
+            ffi::PyErr_Clear();
+        } else {
+            if ffi::PyDict_SetItemString(interp_dict, GC_COLLECT_KEY.as_ptr(), collect) < 0 {
+                ffi::PyErr_Clear();
+            }
+            ffi::Py_DECREF(collect);
+        }
+        ffi::Py_DECREF(gc);
     }
     ffi::Py_DECREF(callable);
     ffi::Py_DECREF(atexit);

@@ -389,6 +389,10 @@ not yet support subinterpreters`),而这个分支**默默给你别的解释器�
 
 ### C. 销毁子解释器时段错误
 
+> **2026-09-22 更新(M4.1,#12)**:已归因并消失。M1.3 时期的包 `writefile` N=8 5/10 段错误,
+> M2.2 之后 10/10 干净 —— 而那时 teardown 里的 import 还在。根因是进程级 `PyOnceLock`
+> (首个解释器的对象被销毁后仍被别的解释器用),不是 import。见 `SUBINTERP-FIXES.md` "M4 status"。
+
 `≥2` 个解释器做过 polars 并行计算之后销毁,`writefile`(**完全不经 Python 回调**)
 和 `compute`(**完全不写**)都崩,而 `import` / 建 `DataFrame` 不崩:
 
@@ -415,7 +419,12 @@ own-GIL N=1 1200 轮   +51 KB/轮,前半 56 / 后半 46 —— 略减速,但 120
   写 200 次            +49 KB/轮   ← 和写次数无关
 ```
 
-**legacy(shared-GIL)配置下的 A/B 是干净的,归因明确:**
+> **2026-09-22 更正(#13)**:下面这组 A/B **无效**。上游 PyO3 在任何子解释器里(含 legacy)
+> 第一轮就拒绝加载(`ImportError: PyO3 modules do not yet support subinterpreters`),
+> 所以"上游 平、7.1s"量的是每轮 import 都失败、根本没加载 polars 的解释器。
+> 主解释器里同源 A/B:import 耗时 fork ≈ 上游 ×1.02,**没有 3.7 倍**。见 `SUBINTERP-FIXES.md` "M4 status"。
+
+**legacy(shared-GIL)配置下的 A/B 是干净的,归因明确:**(原文,已被上面更正推翻)
 
 ```
 上游 .so    330 轮 RSS 92.9 → 93.1 MB   +0.6 KB/轮(平)   用时  7.1s
