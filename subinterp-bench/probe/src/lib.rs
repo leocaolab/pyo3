@@ -309,6 +309,43 @@ fn intern_ns(py: Python<'_>, n: u64) -> f64 {
     t.elapsed().as_nanos() as f64 / n as f64
 }
 
+/// Address of the `sys` module cached in a `static PyOnceLock` (compare with `id(sys)`).
+#[pyfunction]
+fn once_lock_sys_ptr(py: Python<'_>) -> PyResult<usize> {
+    static SYS: pyo3::sync::PyOnceLock<Py<PyModule>> = pyo3::sync::PyOnceLock::new();
+    let m = SYS.get_or_try_init(py, || py.import("sys").map(Bound::unbind))?;
+    Ok(m.as_ptr() as usize)
+}
+
+/// A heap `PyOnceLock` dropped while attached releases its value, and a fresh one never
+/// observes it. Returns (refcount restored, fresh lock empty).
+#[pyfunction]
+fn once_lock_heap_check(py: Python<'_>) -> PyResult<(bool, bool)> {
+    let obj = py.eval(c"type('OnceLockProbe', (), {})", None, None)?.unbind();
+    let before = obj.get_refcnt(py);
+    let lock = pyo3::sync::PyOnceLock::<Py<PyAny>>::new();
+    lock.get_or_init(py, || obj.clone_ref(py));
+    drop(lock);
+    let restored = obj.get_refcnt(py) == before;
+    let fresh = pyo3::sync::PyOnceLock::<Py<PyAny>>::new();
+    let empty = fresh.get(py).is_none();
+    Ok((restored, empty))
+}
+
+/// ns per `PyOnceLock::get` after init, n times.
+#[pyfunction]
+fn once_lock_ns(py: Python<'_>, n: u64) -> f64 {
+    static CELL: pyo3::sync::PyOnceLock<usize> = pyo3::sync::PyOnceLock::new();
+    CELL.get_or_init(py, || 7);
+    let t = std::time::Instant::now();
+    let mut acc = 0usize;
+    for _ in 0..n {
+        acc = acc.wrapping_add(*std::hint::black_box(&CELL).get(py).unwrap());
+    }
+    std::hint::black_box(acc);
+    t.elapsed().as_nanos() as f64 / n as f64
+}
+
 #[pymodule] fn abi3t(m: &Bound<'_, PyModule>) -> PyResult<()> {
     #[cfg(feature = "submodule")]
     m.add_wrapped(wrap_pymodule!(inner))?;
@@ -325,6 +362,9 @@ fn intern_ns(py: Python<'_>, n: u64) -> f64 {
     m.add_function(wrap_pyfunction!(interned_ptr, m)?)?;
     m.add_function(wrap_pyfunction!(this_interp_id, m)?)?;
     m.add_function(wrap_pyfunction!(intern_ns, m)?)?;
+    m.add_function(wrap_pyfunction!(once_lock_sys_ptr, m)?)?;
+    m.add_function(wrap_pyfunction!(once_lock_heap_check, m)?)?;
+    m.add_function(wrap_pyfunction!(once_lock_ns, m)?)?;
     #[cfg(not(feature = "abi3"))]
     {
         m.add_function(wrap_pyfunction!(current_interp_id, m)?)?;

@@ -139,31 +139,39 @@ designed for statics. No API change.
 
 ### M2.2 `PyOnceLock` per interpreter
 
-`PerInterpreterCell` cannot back `PyOnceLock` directly. `PerInterpreterCell`
-claims a global index forever, and `PyOnceLock` is also used as a field of
-heap values created at runtime, so every instance would leak an index.
+The first design (a fast-path `first` slot plus a per-interpreter hash map keyed
+by a never-reused id) was dropped. It needed two lookup paths, an eviction list
+purged on attach, and `get_mut`/`take` that only worked on one interpreter's
+value. What was built instead: `PyOnceLock<T>` is `PerInterpreterCell<OnceCell<T>>`
+(`src/sync/once_lock.rs`), and `PerInterpreterCell` learned to give its index back.
 
-Design:
+- **Reads** use `PerInterpreterCell`'s dense index into the current
+  interpreter's registry (TLS-cached base, `GENERATION`-checked). One path for
+  every interpreter.
+- **Index reuse.** A dropped cell (`PyOnceLock::drop` → `PerInterpreterCell::release`,
+  `src/sync/per_interpreter.rs`) clears its index from **every** live registry
+  first (`REGISTRIES` list, each registry's `lock`), then pushes the index onto
+  `FREE_INDICES`. So a cell that later reuses the index can never read an old
+  value. Statics never drop, so they never release.
+- **Whose value is dropped.** The current interpreter's value is dropped
+  synchronously, which keeps `test_once_cell_drop` (a non-`'static` value
+  dropped with its lock) passing. Values that other interpreters initialized
+  are **leaked**. Dropping them from this thread would decref objects outside
+  their interpreter, and deferring the drop would outlive a non-`'static` `T`.
+  This only matters for a heap `PyOnceLock` that several interpreters wrote to,
+  which no known user does.
+- **`get_mut` / `take` / `into_inner`** (no `py`) act on the value of the
+  interpreter the thread is attached to, and panic if the thread is not
+  attached. Built on `PerInterpreterCell::get_mut`, which takes the pointer
+  from the box and never casts `&T` to `&mut T`.
+- Auto traits are the same as upstream (`PhantomData<OnceCell<T>>`).
 
-```
-PyOnceLock<T> {
-    first: OnceCell<(InterpId, T)>,       // fast path: the first interpreter to initialise
-    others_id: AtomicU64,                 // 0 until a second interpreter uses this lock
-}
-per-interpreter registry: HashMap<u64 /* lock id */, Box<dyn Any>>
-```
-
-- `get` / `get_or_init` / `set` read `first` if its `InterpId` is the current
-  interpreter's. Otherwise they claim `others_id` (a global, never reused
-  counter) and use this interpreter's map.
-- Values in the map are dropped with their interpreter (existing teardown
-  hook). When a `PyOnceLock` is dropped, its id goes on a plain-data eviction
-  list; each interpreter purges those ids on its next attach and at teardown.
-  Ids are never reused, so a stale entry can never be read.
-- `get_mut` / `take` / `into_inner` (no `py`) act on `first` only. They are
-  documented as owner-interpreter operations and panic if `others_id != 0`.
-- Cost: one interpreter-pointer compare on every read. Measure against
-  upstream's atomic load (`JOURNAL.md` "单次调用开销").
+**Known limit.** `get(&'static self)` on a `static` returns `&'static T`, but
+that value is freed when its interpreter is finalized. PyO3's own statics
+use the reference right away, so they are fine. Code that stores the `&'static T`
+past its interpreter's lifetime is now a use-after-free, where upstream
+used the wrong interpreter's object instead. Tying the return lifetime
+to `'py` would fix this, but it is an API change, left for M5.
 
 This fixes, with no downstream change: polars' 13 `PyOnceLock` statics
 (`py_modules.rs:4-8`, `catalog/unity.rs:37-40`, `any_value.rs:545, 552`), and
@@ -180,6 +188,15 @@ With M2.2 most become per-interpreter automatically. List the ones that don't.
 `RETRO-subinterp.md` states that interned strings are "mostly immortal" on
 3.12+. That is wrong (measured, `SUBINTERP-AUDIT.md`, "Measured facts"). Fix
 it, and link the measurement.
+
+### M2 status (2026-09-22)
+
+| item | status |
+|---|---|
+| M2.1 `Interned` (#5) | done (`3c5d769`) |
+| M2.2 `PyOnceLock` (#6) | done. `cache_probe.py`, N=4, 3.14 macOS: a `static PyOnceLock` holding `sys` gives each interpreter its own `sys` 4/4 with one shared `.so` (upstream 1/4); heap lock drop releases its value and a fresh lock is empty, 4/4; `get` 1.6 ns (upstream 0.3 ns). `attach_probe.py` unchanged. **polars bug B, polars unmodified** (`polars_bugb_check.py`, N=4 × 20 rounds of `map_elements(return_dtype=pl.Int64)`): shared polars went from 3/4 interpreters getting another interpreter's `Int64` to 80/80 correct; copies 80/80 before and after |
+| found on the way | `LazyTypeObject.initializing_threads` was process-wide. A successful init `clear()`ed it, wiping another interpreter's in-flight entry. That thread lost its reentrancy guard, re-entered its own `#[pyclass]` enum-variant singleton `PyOnceLock`, and deadlocked (4 interpreters importing one shared polars at once, `PyOperator`). Hidden until M2.2 because the singleton used to be shared. Now per interpreter |
+| unit tests | 860, parallel and serial. The three `per_interpreter` teardown tests now tear down a real own-GIL sub-interpreter (`Py_EndInterpreter`) instead of the main interpreter's registry, which other parallel tests now depend on. Assertions unchanged; mutation-checked: removing `Registry::drop`'s attach guard still fails `registry_teardown_releases_its_values`. They need 3.12+ and the full API |
 
 ### M2 acceptance
 

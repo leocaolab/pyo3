@@ -1,6 +1,6 @@
 use crate::{
-    internal::state::SuspendAttach, types::any::PyAnyMethods, Bound, Py, PyResult, PyTypeCheck,
-    Python,
+    internal::state::SuspendAttach, sync::PerInterpreterCell, types::any::PyAnyMethods, Bound,
+    Py, PyResult, PyTypeCheck, Python,
 };
 
 /// An equivalent to [`std::sync::OnceLock`] for initializing objects while attached to
@@ -34,23 +34,58 @@ use crate::{
 /// }
 /// # Python::attach(|py| assert_eq!(get_shared_list(py).len(), 0));
 /// ```
-#[derive(Default)]
+///
+/// # One value per interpreter
+///
+/// Under PEP 684 each sub-interpreter has its own GIL, and a Python object belongs to exactly
+/// one interpreter. A `PyOnceLock` therefore holds **one value per interpreter**: each
+/// interpreter initializes (at most once) and reads its own, and never observes another
+/// interpreter's. With a single interpreter this behaves exactly like a `OnceLock`.
+///
+/// The value is stored in the interpreter's own registry and is dropped when that interpreter
+/// is finalized. When a `PyOnceLock` itself is dropped (a field of a heap value), the current
+/// interpreter's value is dropped immediately; values that other interpreters initialized are
+/// removed and **leaked**, because dropping them from this thread would touch another
+/// interpreter's objects.
 pub struct PyOnceLock<T> {
-    inner: once_cell::sync::OnceCell<T>,
+    cell: PerInterpreterCell<once_cell::sync::OnceCell<T>>,
+    /// `PerInterpreterCell<X>` is `Sync` whenever `X: Send`, which would make this `Sync` for
+    /// `T: Send` alone. Sharing `&T` across threads needs `T: Sync` as well, exactly as for
+    /// `OnceCell<T>`; this marker keeps the auto traits identical to upstream.
+    _auto_traits: core::marker::PhantomData<once_cell::sync::OnceCell<T>>,
+}
+
+impl<T> Default for PyOnceLock<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// `get_mut` / `take` / `into_inner` take no `Python` token, but the value they act on belongs
+/// to an interpreter: the one this thread is attached to.
+fn attached_or_panic(method: &str) -> Python<'static> {
+    assert!(
+        crate::internal::state::thread_is_attached(),
+        "PyOnceLock::{method} acts on the current interpreter's value and needs this thread to be \
+         attached to one (call it inside Python::attach)"
+    );
+    // SAFETY: checked just above.
+    unsafe { Python::assume_attached() }
 }
 
 impl<T> PyOnceLock<T> {
     /// Create a `PyOnceLock` which does not yet contain a value.
     pub const fn new() -> Self {
         Self {
-            inner: once_cell::sync::OnceCell::new(),
+            cell: PerInterpreterCell::new(),
+            _auto_traits: core::marker::PhantomData,
         }
     }
 
     /// Get a reference to the contained value, or `None` if the cell has not yet been written.
     #[inline]
-    pub fn get(&self, _py: Python<'_>) -> Option<&T> {
-        self.inner.get()
+    pub fn get(&self, py: Python<'_>) -> Option<&T> {
+        self.cell.get(py)?.get()
     }
 
     /// Get a reference to the contained value, initializing it if needed using the provided
@@ -62,9 +97,9 @@ impl<T> PyOnceLock<T> {
     where
         F: FnOnce() -> T,
     {
-        self.inner
-            .get()
-            .unwrap_or_else(|| init_once_cell_py_attached(&self.inner, py, f))
+        let cell = self.cell.get_or_init(py, once_cell::sync::OnceCell::new);
+        cell.get()
+            .unwrap_or_else(|| init_once_cell_py_attached(cell, py, f))
     }
 
     /// Like `get_or_init`, but accepts a fallible initialization function. If it fails, the cell
@@ -75,37 +110,57 @@ impl<T> PyOnceLock<T> {
     where
         F: FnOnce() -> Result<T, E>,
     {
-        self.inner
-            .get()
-            .map_or_else(|| try_init_once_cell_py_attached(&self.inner, py, f), Ok)
+        let cell = self.cell.get_or_init(py, once_cell::sync::OnceCell::new);
+        cell.get()
+            .map_or_else(|| try_init_once_cell_py_attached(cell, py, f), Ok)
+    }
+
+    /// The current interpreter's `OnceCell`, mutably.
+    fn current_cell_mut(&mut self, method: &str) -> Option<&mut once_cell::sync::OnceCell<T>> {
+        let py = attached_or_panic(method);
+        self.cell.get_mut(py)
     }
 
     /// Get the contents of the cell mutably. This is only possible if the reference to the cell is
     /// unique.
+    ///
+    /// Acts on the value of the interpreter this thread is attached to; panics if it is not
+    /// attached.
     pub fn get_mut(&mut self) -> Option<&mut T> {
-        self.inner.get_mut()
+        self.current_cell_mut("get_mut")?.get_mut()
     }
 
     /// Set the value in the cell.
     ///
     /// If the cell has already been written, `Err(value)` will be returned containing the new
     /// value which was not written.
-    pub fn set(&self, _py: Python<'_>, value: T) -> Result<(), T> {
-        self.inner.set(value)
+    pub fn set(&self, py: Python<'_>, value: T) -> Result<(), T> {
+        self.cell
+            .get_or_init(py, once_cell::sync::OnceCell::new)
+            .set(value)
     }
 
     /// Takes the value out of the cell, moving it back to an uninitialized state.
     ///
-    /// Has no effect and returns None if the cell has not yet been written.
+    /// Has no effect and returns None if the cell has not yet been written. Acts on the value of
+    /// the interpreter this thread is attached to; panics if it is not attached.
     pub fn take(&mut self) -> Option<T> {
-        self.inner.take()
+        self.current_cell_mut("take")?.take()
     }
 
     /// Consumes the cell, returning the wrapped value.
     ///
-    /// Returns None if the cell has not yet been written.
-    pub fn into_inner(self) -> Option<T> {
-        self.inner.into_inner()
+    /// Returns None if the cell has not yet been written. Acts on the value of the interpreter
+    /// this thread is attached to; panics if it is not attached.
+    pub fn into_inner(mut self) -> Option<T> {
+        self.current_cell_mut("into_inner")?.take()
+        // `self` drops here, which releases the other interpreters' slots.
+    }
+}
+
+impl<T> Drop for PyOnceLock<T> {
+    fn drop(&mut self) {
+        self.cell.release();
     }
 }
 

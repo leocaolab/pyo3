@@ -32,7 +32,13 @@ struct LazyTypeObjectInner {
     value: PerInterpreterCell<PyClassTypeObject>,
     // Threads which have begun initialization of the `tp_dict`. Used for
     // reentrant initialization detection.
-    initializing_threads: Mutex<Vec<ThreadId>>,
+    //
+    // Per interpreter, like the type object itself: a successful init clears
+    // the list, and a process-wide list let one interpreter's init clear
+    // another's in-flight entry. That thread then lost its reentrancy
+    // guard, re-entered its own enum-variant singleton `PyOnceLock`, and
+    // deadlocked (polars `PyOperator`, two interpreters importing at once).
+    initializing_threads: PerInterpreterCell<Mutex<Vec<ThreadId>>>,
     fully_initialized_type: PerInterpreterCell<Py<PyType>>,
 }
 
@@ -43,7 +49,7 @@ impl<T> LazyTypeObject<T> {
         LazyTypeObject(
             LazyTypeObjectInner {
                 value: PerInterpreterCell::new(),
-                initializing_threads: Mutex::new(Vec::new()),
+                initializing_threads: PerInterpreterCell::new(),
                 fully_initialized_type: PerInterpreterCell::new(),
             },
             PhantomData,
@@ -130,8 +136,11 @@ impl LazyTypeObjectInner {
         }
 
         let thread_id = thread::current().id();
+        let initializing_threads = self
+            .initializing_threads
+            .get_or_init(py, || Mutex::new(Vec::new()));
         {
-            let mut threads = self.initializing_threads.lock().unwrap();
+            let mut threads = initializing_threads.lock().unwrap();
             if threads.contains(&thread_id) {
                 // Reentrant call: just return the type object, even if the
                 // `tp_dict` is not filled yet.
@@ -152,7 +161,7 @@ impl LazyTypeObjectInner {
         }
 
         let guard = InitializationGuard {
-            initializing_threads: &self.initializing_threads,
+            initializing_threads,
             thread_id,
         };
 
@@ -213,7 +222,7 @@ impl LazyTypeObjectInner {
             // (No further calls to get_or_init() will try to init, on any thread.)
             let mut threads = {
                 drop(guard);
-                self.initializing_threads.lock().unwrap()
+                initializing_threads.lock().unwrap()
             };
             threads.clear();
             Ok(type_object.clone().unbind())

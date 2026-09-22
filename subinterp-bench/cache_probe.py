@@ -9,7 +9,12 @@ cached Python object is per interpreter:
              another interpreter's object means a shared live refcount, and a
              dangling pointer once that interpreter is destroyed).
 
-Also reports the per-lookup cost of intern!.
+  PyOnceLock — a `static PyOnceLock<Py<PyModule>>` holding `sys` must hold this
+             interpreter's own `sys` (upstream: the first interpreter's, everywhere);
+             a heap PyOnceLock dropped while attached must release its value, and a
+             fresh one must be empty (index reuse never leaks an old value).
+
+Also reports the per-lookup cost of intern! and PyOnceLock::get.
 
 Usage:  python3.14 subinterp-bench/cache_probe.py [N]
 """
@@ -34,7 +39,9 @@ CHILD = textwrap.dedent(r'''
         it.exec(pre + f"import sys; sys.path.insert(0, {d!r}); import abi3t\n"
                 "own = sys.intern(''.join(['subinterp_probe_', 'interned_key']))\n"
                 "q.put(repr((abi3t.this_interp_id(), abi3t.interned_ptr(), id(own), "
-                "sorted(abi3t.intern_ns(200000) for _ in range(7))[3])))")
+                "sorted(abi3t.intern_ns(200000) for _ in range(7))[3], "
+                "abi3t.once_lock_sys_ptr(), id(sys), abi3t.once_lock_heap_check(), "
+                "sorted(abi3t.once_lock_ns(200000) for _ in range(7))[3])))")
         rows.append(eval(q.get()))
     print(json.dumps(rows))
 ''')
@@ -51,13 +58,15 @@ def run(build, deploy):
     return json.loads(p.stdout.strip().splitlines()[-1]), None
 
 print(f"N = {N}, python {sys.version.split()[0]}\n")
-print("| build | deploy | intern! returns this interpreter's own interned str | verdict | intern! ns/lookup (median) |")
-print("|---|---|---:|---|---:|")
+print("| build | deploy | intern! own str | PyOnceLock own `sys` | heap lock drop / reuse | intern! ns | PyOnceLock::get ns |")
+print("|---|---|---:|---:|---:|---:|---:|")
 for build in ("so_base", "so_fork"):
     for deploy in ("shared", "copies"):
         rows, err = run(build, deploy)
         if err:
-            print(f"| {build} | {deploy} | — | error: {err[:80]} | |"); continue
+            print(f"| {build} | {deploy} | error: {err[:80]} | | | | |"); continue
         own = sum(1 for r in rows if r[1] == r[2])
-        ok = own == N
-        print(f"| {build} | {deploy} | {own}/{N} | {'per-interpreter' if ok else 'WRONG interpreter'} | {statistics.median(r[3] for r in rows):.2f} |")
+        sys_own = sum(1 for r in rows if r[4] == r[5])
+        heap = sum(1 for r in rows if r[6] == [True, True] or r[6] == (True, True))
+        print(f"| {build} | {deploy} | {own}/{N} | {sys_own}/{N} | {heap}/{N} | "
+              f"{statistics.median(r[3] for r in rows):.2f} | {statistics.median(r[7] for r in rows):.2f} |")

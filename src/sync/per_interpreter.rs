@@ -50,7 +50,20 @@ const HOOK_KEY: &CStr = c"_pyo3_per_interpreter_hook";
 /// assigned in first-use order.
 static NEXT_INDEX: AtomicUsize = AtomicUsize::new(0);
 
+/// Indices released by dropped cells (a `PyOnceLock` that was a field of a heap value), ready
+/// for reuse. An index is pushed here only after it has been cleared from every registry, so a
+/// new cell that reuses it can never observe an old value.
+static FREE_INDICES: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+
+/// Every live registry, so a dropped cell can clear its index from all interpreters.
+/// Lock order: `REGISTRIES`, then a registry's `lock`.
+static REGISTRIES: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+
 const UNCLAIMED: usize = usize::MAX;
+
+fn lock_ignoring_poison<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 /// Bumped whenever a cached base pointer could have become wrong: a registry is dropped, or its
 /// backing storage is reallocated.
@@ -73,10 +86,18 @@ type Slot = (*mut c_void, unsafe fn(*mut c_void));
 /// One interpreter's values, indexed by cell.
 struct Registry {
     slots: Vec<Option<Slot>>,
+    /// Serialises structural changes: growth in `set_and_get`, and clearing an index from
+    /// another thread when a cell is dropped. Reads never take it: a reader holds `&cell`, and a
+    /// cell cannot be dropped while it is borrowed.
+    lock: std::sync::Mutex<()>,
 }
 
 impl Drop for Registry {
     fn drop(&mut self) {
+        // Unregister first, so no dropped cell on another thread reaches into this registry
+        // while it is being torn down.
+        let me = self as *mut Registry as usize;
+        lock_ignoring_poison(&REGISTRIES).retain(|&r| r != me);
         // This registry's storage is about to go, and the interpreter's address may be reused.
         invalidate_caches();
         // CPython reaches this from a capsule destructor, which it calls without going through
@@ -142,7 +163,9 @@ impl<T> PerInterpreterCell<T> {
 
     #[cold]
     fn claim_index(&self) -> usize {
-        let fresh = NEXT_INDEX.fetch_add(1, Ordering::Relaxed);
+        let fresh = lock_ignoring_poison(&FREE_INDICES)
+            .pop()
+            .unwrap_or_else(|| NEXT_INDEX.fetch_add(1, Ordering::Relaxed));
         // If another thread claimed one first, use theirs and leave ours unused. A gap costs one
         // pointer in each registry.
         match self
@@ -150,8 +173,57 @@ impl<T> PerInterpreterCell<T> {
             .compare_exchange(UNCLAIMED, fresh, Ordering::Relaxed, Ordering::Relaxed)
         {
             Ok(_) => fresh,
-            Err(existing) => existing,
+            Err(existing) => {
+                // Lost the race: give the index back.
+                lock_ignoring_poison(&FREE_INDICES).push(fresh);
+                existing
+            }
         }
+    }
+
+    /// Clears this cell's index from every interpreter and makes the index reusable.
+    ///
+    /// The current interpreter's value (if this thread is attached through PyO3) is dropped here.
+    /// Another interpreter's value is **leaked**, never dropped from this thread: that would
+    /// decref its objects outside their interpreter, which is the defect this module exists to
+    /// prevent, and deferring the drop would outlive a non-`'static` `T`.
+    ///
+    /// Only for cells that are dropped (`PyOnceLock` fields of heap values); a `static` never is.
+    pub(crate) fn release(&mut self) {
+        let idx = *self.index.get_mut();
+        if idx == UNCLAIMED {
+            return;
+        }
+        *self.index.get_mut() = UNCLAIMED;
+        // SAFETY: only reads the registry pointer if PyO3 has this thread attached.
+        let current = if crate::internal::state::thread_is_attached() {
+            unsafe { find_registry() as usize }
+        } else {
+            0
+        };
+        let mut own: Option<Slot> = None;
+        {
+            let regs = lock_ignoring_poison(&REGISTRIES);
+            for &r in regs.iter() {
+                // SAFETY: a registry stays in `REGISTRIES` until its `Drop` removes it, which
+                // takes the `REGISTRIES` lock held here.
+                let reg = unsafe { &mut *(r as *mut Registry) };
+                let _structural = lock_ignoring_poison(&reg.lock);
+                if let Some(slot) = reg.slots.get_mut(idx).and_then(Option::take) {
+                    if r == current {
+                        own = Some(slot);
+                    }
+                    // else: another interpreter's value, leaked (see above).
+                }
+            }
+        }
+        // Dropped outside every lock: the drop can run Python code that uses other cells.
+        if let Some(slot) = own {
+            // SAFETY: the slot records its own drop function; this thread is attached to the
+            // interpreter that owns it.
+            unsafe { (slot.1)(slot.0) }
+        }
+        lock_ignoring_poison(&FREE_INDICES).push(idx);
     }
 
     /// Returns a reference to this interpreter's value, if it has been initialized here.
@@ -167,6 +239,25 @@ impl<T> PerInterpreterCell<T> {
             }
             let slot = (*base.add(idx))?;
             Some(&*(slot.0 as *const T))
+        }
+    }
+
+    /// Returns a mutable reference to this interpreter's value, if it has been initialized here.
+    ///
+    /// `&mut self` rules out every other borrow of this cell; other interpreters' values are
+    /// separate allocations.
+    #[inline]
+    pub fn get_mut(&mut self, py: Python<'_>) -> Option<&mut T> {
+        let idx = self.index();
+        // SAFETY: as in `get`; the slot pointer came from `Box::into_raw`, so it is a unique,
+        // mutable pointer to a live `T`, and `&mut self` makes this the only borrow of it.
+        unsafe {
+            let (base, len) = current_registry(py)?;
+            if idx >= len {
+                return None;
+            }
+            let slot = (*base.add(idx))?;
+            Some(&mut *(slot.0 as *mut T))
         }
     }
 
@@ -209,6 +300,7 @@ impl<T> PerInterpreterCell<T> {
                 return &*boxed;
             }
             let registry = &mut *registry;
+            let _structural = lock_ignoring_poison(&registry.lock);
             if registry.slots.len() <= idx {
                 registry.slots.resize(idx + 1, None);
             }
@@ -294,7 +386,10 @@ unsafe fn ensure_registry(_py: Python<'_>) -> *mut Registry {
     if interp_dict.is_null() {
         return core::ptr::null_mut();
     }
-    let registry = Box::into_raw(Box::new(Registry { slots: Vec::new() }));
+    let registry = Box::into_raw(Box::new(Registry {
+        slots: Vec::new(),
+        lock: std::sync::Mutex::new(()),
+    }));
     let capsule = ffi::PyCapsule_New(
         registry as *mut c_void,
         CAPSULE_NAME.as_ptr(),
@@ -312,6 +407,7 @@ unsafe fn ensure_registry(_py: Python<'_>) -> *mut Registry {
         // Releasing the capsule destroyed the registry with it.
         return core::ptr::null_mut();
     }
+    lock_ignoring_poison(&REGISTRIES).push(registry as usize);
     register_teardown_hook(interp_dict);
     registry
 }
@@ -476,11 +572,49 @@ mod tests {
     use super::*;
     use crate::types::any::PyAnyMethods;
     use crate::{Py, PyAny, Python};
-    use std::sync::Mutex;
-
-    /// Serialises the tests below. Each one tears down the registry every cell in the process
-    /// shares, so two of them running at once would drop each other's values.
-    static TEARDOWN: Mutex<()> = Mutex::new(());
+    /// Runs `f` inside a fresh own-GIL sub-interpreter on a fresh thread, then ends that
+    /// interpreter for real with `Py_EndInterpreter`.
+    ///
+    /// The tests below tear a registry down. Doing that to the main interpreter's registry in a
+    /// live test process pulls it out from under every test running in parallel: it also holds
+    /// PyO3's own cached objects (exception types, `PyOnceLock` values), so their `&'static`
+    /// references dangle. A sub-interpreter's registry belongs to that test alone.
+    #[cfg(all(Py_3_12, not(Py_LIMITED_API)))]
+    fn in_sub_interpreter<R: Send>(f: impl FnOnce(Python<'_>) -> R + Send) -> R {
+        // The raw `PyGILState_Ensure` below needs an initialized runtime; when these tests run
+        // alone nothing else has initialized it yet.
+        Python::initialize();
+        std::thread::scope(|scope| {
+            scope
+                .spawn(move || {
+                    // SAFETY: standard sub-interpreter lifecycle on a thread with no thread
+                    // state: take main's GIL, create the interpreter (which detaches main's thread
+                    // state and makes the new one current), run, end it (leaving no current thread
+                    // state), then restore main's and release.
+                    unsafe {
+                        let gstate = ffi::PyGILState_Ensure();
+                        let main = ffi::PyThreadState_Get();
+                        let config = ffi::_PyInterpreterConfig_INIT;
+                        let mut sub: *mut ffi::PyThreadState = core::ptr::null_mut();
+                        let status = ffi::Py_NewInterpreterFromConfig(&mut sub, &config);
+                        assert!(
+                            ffi::PyStatus_Exception(status) == 0 && !sub.is_null(),
+                            "Py_NewInterpreterFromConfig failed"
+                        );
+                        let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            let _attached = AssumeAttached::new();
+                            f(Python::assume_attached())
+                        }));
+                        ffi::Py_EndInterpreter(sub);
+                        ffi::PyEval_RestoreThread(main);
+                        ffi::PyGILState_Release(gstate);
+                        out.unwrap_or_else(|e| std::panic::resume_unwind(e))
+                    }
+                })
+                .join()
+                .unwrap_or_else(|e| std::panic::resume_unwind(e))
+        })
+    }
 
     /// Drops this interpreter's registry the way CPython does at finalization, **including the
     /// part that matters**: from a thread PyO3 has never attached.
@@ -496,22 +630,27 @@ mod tests {
     /// be handed over through the raw C API rather than [`Python::detach`]. `SuspendAttach`'s
     /// `Drop` applies the deferred reference pool on the way back in, which would settle the very
     /// decrefs this is here to catch and turn the test green against the bug.
+    #[cfg(all(Py_3_12, not(Py_LIMITED_API)))]
     fn drop_registry_as_cpython_would(py: Python<'_>) {
         let _ = py;
+        // SAFETY: the caller is attached, so there is a current interpreter.
+        let interp = unsafe { ffi::PyInterpreterState_Get() } as usize;
         // SAFETY: the caller is attached, so there is a thread state to release; no Python
         // object is touched until it is restored below.
         let tstate = unsafe { ffi::PyEval_SaveThread() };
-        let joined = std::thread::spawn(|| {
-            // SAFETY: taking the GIL through the C API, as CPython would before calling a
-            // capsule destructor. PyO3 does not observe this transition, which is the point.
+        let joined = std::thread::spawn(move || {
+            // SAFETY: taking the caller's interpreter through the C API with a fresh thread
+            // state, as CPython would before calling a capsule destructor. PyO3 does not observe
+            // this transition, which is the point. `interp` is alive: its only other thread is
+            // the caller, blocked in `join` below.
             unsafe {
-                let gstate = ffi::PyGILState_Ensure();
+                let ts = crate::internal::home::attach_home(interp as *mut ffi::PyInterpreterState);
                 let dict = ffi::PyInterpreterState_GetDict(ffi::PyInterpreterState_Get());
                 assert!(!dict.is_null());
                 if ffi::PyDict_DelItemString(dict, REGISTRY_KEY.as_ptr()) < 0 {
                     ffi::PyErr_Clear();
                 }
-                ffi::PyGILState_Release(gstate);
+                crate::internal::home::detach_home(ts);
             }
         })
         .join();
@@ -521,6 +660,7 @@ mod tests {
         joined.unwrap();
     }
 
+    #[cfg(all(Py_3_12, not(Py_LIMITED_API)))]
     fn refcount(py: Python<'_>, obj: &Py<PyAny>) -> isize {
         // SAFETY: `obj` is a live object and the interpreter is attached.
         let _ = py;
@@ -539,11 +679,9 @@ mod tests {
     /// the stress test that did create thousands of them happened to keep an instance alive, which
     /// routes the release through CPython's `subtype_dealloc` instead of through the registry.
     #[test]
+    #[cfg(all(Py_3_12, not(Py_LIMITED_API)))]
     fn registry_teardown_releases_its_values() {
-        // Taken before attaching: the teardown below needs the GIL on another thread, so a test
-        // waiting here must not be holding it.
-        let _serialised = TEARDOWN.lock().unwrap_or_else(|e| e.into_inner());
-        Python::attach(|py| {
+        in_sub_interpreter(|py| {
             static CELL: PerInterpreterCell<Py<PyAny>> = PerInterpreterCell::new();
 
             // A fresh Python class: a heap type with an ordinary refcount, so a missing decref is
@@ -572,9 +710,9 @@ mod tests {
 
     /// After teardown the cell must read as empty rather than hand back a dangling pointer.
     #[test]
+    #[cfg(all(Py_3_12, not(Py_LIMITED_API)))]
     fn cell_is_empty_after_teardown() {
-        let _serialised = TEARDOWN.lock().unwrap_or_else(|e| e.into_inner());
-        Python::attach(|py| {
+        in_sub_interpreter(|py| {
             static CELL: PerInterpreterCell<Py<PyAny>> = PerInterpreterCell::new();
             let value: Py<PyAny> = py.None();
             CELL.get_or_init(py, || value.clone_ref(py));
@@ -594,9 +732,9 @@ mod tests {
     /// share an address — which made both cells claim the same slot, overwrite each other, and
     /// abort all 850 tests with a null type pointer.
     #[test]
+    #[cfg(all(Py_3_12, not(Py_LIMITED_API)))]
     fn neighbouring_cells_have_distinct_slots() {
-        let _serialised = TEARDOWN.lock().unwrap_or_else(|e| e.into_inner());
-        Python::attach(|py| {
+        in_sub_interpreter(|py| {
             struct Pair {
                 a: PerInterpreterCell<Py<PyAny>>,
                 b: PerInterpreterCell<Py<PyAny>>,
@@ -613,7 +751,6 @@ mod tests {
 
             assert!(PAIR.a.get(py).unwrap().bind(py).eq("first").unwrap());
             assert!(PAIR.b.get(py).unwrap().bind(py).eq("second").unwrap());
-            drop_registry_as_cpython_would(py);
         });
     }
 }
