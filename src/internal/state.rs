@@ -55,6 +55,9 @@ pub(crate) enum AttachGuard {
     Assumed { cell: *const () },
     /// Indicates that we attached when this AttachGuard was acquired
     Ensured { gstate: ffi::PyGILState_STATE },
+    /// A thread with no Python thread state, attached to this extension copy's
+    /// home interpreter with a fresh thread state (see `internal::home`).
+    Home { tstate: *mut ffi::PyThreadState },
 }
 
 /// Possible error when calling `try_attach()`
@@ -66,6 +69,12 @@ pub(crate) enum AttachError {
     #[cfg(Py_3_13)]
     /// The interpreter is finalizing.
     Finalizing,
+    /// A thread with no Python thread state tried to attach, and this extension
+    /// copy was loaded by more than one interpreter: which one is meant is unknown.
+    AmbiguousInterpreter,
+    /// A thread with no Python thread state tried to attach, and the only
+    /// interpreter that loaded this extension copy has been finalized.
+    HomeGone,
 }
 
 impl AttachGuard {
@@ -88,6 +97,22 @@ impl AttachGuard {
             #[cfg(Py_3_13)]
             Err(AttachError::Finalizing) => {
                 panic!("Cannot attach to the Python interpreter while it is finalizing.");
+            }
+            Err(AttachError::AmbiguousInterpreter) => {
+                panic!(
+                    "Python::attach was called on a thread that has no Python thread state \
+                     (e.g. a rayon, tokio or std::thread worker), and this extension is loaded \
+                     by more than one interpreter, so PyO3 cannot tell which one is meant. \
+                     Attaching to the main interpreter would run another interpreter's objects \
+                     under the wrong GIL. Capture a pyo3::sync::InterpreterHandle where the \
+                     Python object is obtained and call handle.attach(...) on this thread."
+                );
+            }
+            Err(AttachError::HomeGone) => {
+                panic!(
+                    "Python::attach was called on a thread that has no Python thread state, \
+                     after the only interpreter that loaded this extension was finalized."
+                );
             }
         }
     }
@@ -126,6 +151,33 @@ impl AttachGuard {
         if unsafe { ffi::Py_IsFinalizing() } != 0 {
             // If the interpreter is not initialized, we cannot attach.
             return Err(AttachError::Finalizing);
+        }
+
+        // A thread with no Python thread state at all (rayon, tokio, std::thread):
+        // `PyGILState_Ensure` would bind it to the MAIN interpreter. Send it to this
+        // extension copy's home interpreter instead, or fail loudly (M1.3, #4).
+        // Threads that already have a thread state keep the old path; re-attach
+        // after `py.detach` was measured correct (subinterp-bench/attach_probe.py).
+        // SAFETY: always safe to call.
+        if unsafe { ffi::PyGILState_GetThisThreadState() }.is_null() {
+            match crate::internal::home::foreign_target() {
+                crate::internal::home::ForeignTarget::Gilstate => {}
+                crate::internal::home::ForeignTarget::Home(interp) => {
+                    // SAFETY: the home is alive (cleared by its teardown hook) and this
+                    // thread has no thread state.
+                    let tstate = unsafe { crate::internal::home::attach_home(interp) };
+                    increment_attach_count();
+                    // SAFETY: just attached to the home interpreter.
+                    drop_deferred_references(unsafe { Python::assume_attached() });
+                    return Ok(AttachGuard::Home { tstate });
+                }
+                crate::internal::home::ForeignTarget::Ambiguous => {
+                    return Err(AttachError::AmbiguousInterpreter)
+                }
+                crate::internal::home::ForeignTarget::HomeGone => {
+                    return Err(AttachError::HomeGone)
+                }
+            }
         }
 
         // SAFETY: We have done everything reasonable to ensure we're in a safe state to
@@ -213,6 +265,10 @@ impl Drop for AttachGuard {
             AttachGuard::Ensured { gstate } => unsafe {
                 // Drop the objects in the pool before attempting to release the thread state
                 ffi::PyGILState_Release(*gstate);
+            },
+            AttachGuard::Home { tstate } => unsafe {
+                // SAFETY: created by `attach_home` in `try_attach` and still current.
+                crate::internal::home::detach_home(*tstate);
             },
         }
         decrement_attach_count();

@@ -22,6 +22,9 @@ pub unsafe fn module_exec(
     // SAFETY: f accepts a Bound object so Python is attached
     unsafe {
         trampoline(|py| {
+            // Record which interpreter runs this extension copy, so a later
+            // `Python::attach` from a foreign thread goes there (or fails loudly).
+            crate::internal::home::note_module_exec();
             let module = module.assume_borrowed_or_err(py)?.cast::<PyModule>()?;
             f(&module)?;
             Ok(0)
