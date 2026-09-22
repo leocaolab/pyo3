@@ -31,8 +31,28 @@ N = int(sys.argv[1]) if len(sys.argv) > 1 else 4
 
 CHILD = textwrap.dedent(
     r'''
-    import json, os, sys, threading
-    from concurrent import interpreters
+    import json, os, sys, tempfile, threading
+
+    # 3.14+: concurrent.interpreters. 3.12 / 3.13: the private low-level modules,
+    # with results passed back through a file (they cannot return values).
+    try:
+        from concurrent import interpreters
+    except ImportError:
+        interpreters = None
+        if sys.version_info[:2] == (3, 12):
+            import _xxsubinterpreters as _xi
+            def _create():
+                return _xi.create(isolated=True)
+            def _exec(i, src):
+                _xi.run_string(i, src)
+        else:
+            import _interpreters as _xi
+            def _create():
+                return _xi.create("isolated")
+            def _exec(i, src):
+                err = _xi.exec(i, src)
+                if err is not None:
+                    raise RuntimeError(str(err))
 
     build, deploy, dirs, override = sys.argv[1], sys.argv[2], json.loads(sys.argv[3]), sys.argv[4] == "1"
 
@@ -43,16 +63,26 @@ CHILD = textwrap.dedent(
     rows = []
     interps = []
     for i in range(len(dirs)):
-        it = interpreters.create()
-        it.exec(code_for(dirs[i]))
+        if interpreters is not None:
+            it = interpreters.create()
+            it.exec(code_for(dirs[i]))
+        else:
+            it = _create()
+            _exec(it, code_for(dirs[i]))
         interps.append(it)
 
     def run_in(it, src):
-        box = {}
-        q = interpreters.create_queue()
-        it.prepare_main(q=q)
-        it.exec(src + "\nq.put(repr(result))")
-        return eval(q.get())
+        if interpreters is not None:
+            q = interpreters.create_queue()
+            it.prepare_main(q=q)
+            it.exec(src + "\nq.put(repr(result))")
+            return eval(q.get())
+        fd, path = tempfile.mkstemp(); os.close(fd)
+        try:
+            _exec(it, src + f"\nopen({path!r}, 'w').write(repr(result))")
+            return eval(open(path).read())
+        finally:
+            os.unlink(path)
 
     # pythread origin: a main-interpreter threading.Thread runs the sub-interpreter
     def pythread_cell(it):
@@ -103,7 +133,7 @@ def run(build, deploy):
             d = os.path.join(tmp, f"copy{i}")
             shutil.copytree(src, d)
             dirs.append(d)
-    override = "1" if build == "so_base" else "0"  # upstream cannot load strict
+    override = "1" if build.startswith("so_base") else "0"  # upstream cannot load strict
     import json
     p = subprocess.run(
         [sys.executable, "-c", CHILD, build, deploy, json.dumps(dirs), override],
@@ -128,7 +158,8 @@ def main():
     print(f"N = {N} sub-interpreters, python {sys.version.split()[0]}\n")
     print("| build | deploy | origin | after_detach | new_thread |")
     print("|---|---|---|---|---|")
-    for build in ("so_base", "so_fork"):
+    suffix = os.environ.get("PROBE_SUFFIX", "")
+    for build in ("so_base" + suffix, "so_fork" + suffix):
         if not os.path.isdir(os.path.join(HERE, build)):
             print(f"| {build} | — | — | missing build | |")
             continue
