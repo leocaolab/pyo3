@@ -128,7 +128,12 @@ lldb -b -s /tmp/lldb.txt -- python3.14 subinterp-bench/pool_soak.py /tmp/pl_fixe
 
 ---
 
-## 四、修复尝试 `73f61bb` —— 无效
+## 四、修复尝试 `73f61bb` —— 无效(已删除)
+
+> **2026-09-22,M3.1(#9):这套代码已经删掉**,池子恢复成和上游逐字节一致
+> (`git diff dfdbc46 -- src/internal/state.rs` 里不再有任何 `ReferencePool` 改动)。
+> `current_interpreter_or_null` 保留,因为 `InterpreterHandle::attach` 在用。
+> 下面保留当时的分析,它是 M3.2 设计的依据。
 
 ```
 73f61bbe884d709c62e0dc7bd7efe598e38ed4ce
