@@ -444,6 +444,13 @@ unsafe extern "C" fn teardown(
 ) -> *mut ffi::PyObject {
     // This interpreter is going away: stop sending foreign-thread attaches to it.
     crate::internal::home::on_interpreter_teardown(ffi::PyInterpreterState_Get());
+    // Apply the decrefs still queued for it, while its objects exist (M3.2). CPython calls this
+    // hook directly, so PyO3's attach count is zero: without the guard a destructor run here
+    // would queue its own drops into the pool being removed.
+    {
+        let _attached = AssumeAttached::new();
+        crate::internal::state::drain_pool_on_teardown(Python::assume_attached());
+    }
     let interp_dict = ffi::PyInterpreterState_GetDict(ffi::PyInterpreterState_Get());
     if !interp_dict.is_null() {
         if ffi::PyDict_DelItemString(interp_dict, REGISTRY_KEY.as_ptr()) < 0 {

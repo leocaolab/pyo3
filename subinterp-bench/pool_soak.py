@@ -6,7 +6,12 @@
 【不销毁任何子解释器】,干完活立刻 os._exit(0) 跳过解释器 finalize —— 于是
 一旦崩,就一定是【运行中】崩的,和销毁/退出期的问题无关。
 
-用法: pool_soak.py <polars 包目录> <解释器数 N> <秒数> [collect|write]
+用法: pool_soak.py <polars 包目录> <解释器数 N> <秒数> [collect|write] [shared|copies]
+
+  shared(默认)= 所有解释器 import 同一份包;copies = 每个解释器一份物理拷贝
+  (Pyronova 的 isolate 路线)。M1.3 之后,shared 下工作线程回调 Python 会大声失败
+  (AmbiguousInterpreter),所以池子的正确性要在 copies 下验;shared 验的是"只许大声失败,
+  不许 SIGABRT / 静默损坏"。
 
   N=1 是对照组:同一个包、同一份负载,只改解释器数。它不崩而 N>=4 崩,
   这个差就是"跨解释器"本身 —— 不是 use-after-free,也不是 polars 的线程模型。
@@ -19,10 +24,17 @@ from concurrent import interpreters
 
 PKG, N, SECS = sys.argv[1], int(sys.argv[2]), float(sys.argv[3])
 MODE = sys.argv[4] if len(sys.argv) > 4 else "collect"
+DEPLOY = sys.argv[5] if len(sys.argv) > 5 else "shared"
+if DEPLOY == "copies":
+    import shutil, tempfile
+    _tmp = tempfile.mkdtemp(prefix="pool-soak-")
+    PKGS = [shutil.copytree(PKG, os.path.join(_tmp, "c%d" % i), symlinks=True) for i in range(N)]
+else:
+    PKGS = [PKG] * N
 
 BODY = r'''
 import sys, time, json
-sys.path.insert(0, "__PKG__")
+sys.path.insert(0, _pkg)
 import polars as pl
 from concurrent import interpreters
 
@@ -78,7 +90,7 @@ while time.time() < deadline:
                 if first_bad is None:
                     first_bad = "fmt=%s len=%d/%d 写在解释器 %s (我是 %d)" % (_n, len(sk.buf), len(gold[_n]), sorted(sk.interps), me)
 _q.put(json.dumps([seed, me, ops, bad, first_bad]))
-'''.replace("__PKG__", PKG).replace("__MODE__", MODE)
+'''.replace("__MODE__", MODE)
 
 deadline = time.time() + SECS
 res, errs = [], []
@@ -89,7 +101,7 @@ def w(i):
     try:
         it = interpreters.create()
         q = interpreters.create_queue()
-        it.prepare_main(_q=q, _seed=i + 1, _deadline=deadline)
+        it.prepare_main(_q=q, _seed=i + 1, _deadline=deadline, _pkg=PKGS[i])
         it.exec(BODY)
         with lock:
             res.append(json.loads(q.get()))
@@ -100,7 +112,7 @@ def w(i):
                                     traceback.format_exc().strip().splitlines()[-1][:200]))
 
 
-print("pkg=%s N=%d %.0fs mode=%s" % (PKG, N, SECS, MODE))
+print("pkg=%s N=%d %.0fs mode=%s deploy=%s" % (PKG, N, SECS, MODE, DEPLOY))
 sys.stdout.flush()
 t0 = time.time()
 ts = [threading.Thread(target=w, args=(i,)) for i in range(N)]
@@ -118,4 +130,6 @@ for r in res:
         print("  seed=%d 首个差异 %s" % (r[0], r[4]))
 sys.stdout.flush()
 sys.stderr.flush()
+if DEPLOY == "copies":
+    shutil.rmtree(_tmp, ignore_errors=True)
 os._exit(0 if (not errs and bad == 0 and len(res) == N) else 3)

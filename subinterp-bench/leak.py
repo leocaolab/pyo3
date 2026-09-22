@@ -22,7 +22,8 @@ warnings.filterwarnings("ignore")
 
 # argv 有两种形状:顶层 `leak.py [轮数]`,和它自己派生的子进程 `leak.py <so目录> <用例> <轮数>`
 ROUNDS = int(sys.argv[1]) if len(sys.argv) == 2 else 400
-BUILDS = [("so_base", "对照"), ("so_fork", "fork")]
+BUILDS = ([(b, b) for b in os.environ["LEAK_BUILDS"].split(",")] if "LEAK_BUILDS" in os.environ
+          else [("so_base", "对照"), ("so_fork", "fork")])
 CASES = {
     "imp": ("只 import", ""),
     "row": ("建一个 Row 就扔", "abi3t.Row(1.0, 2)"),

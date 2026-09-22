@@ -10,11 +10,11 @@ use crate::{ffi, Python};
 
 use core::cell::Cell;
 #[cfg(not(pyo3_disable_reference_pool))]
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 #[cfg_attr(pyo3_disable_reference_pool, allow(unused_imports))]
 use core::{mem, ptr::NonNull};
 #[cfg(not(pyo3_disable_reference_pool))]
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 std::thread_local! {
     /// This is an internal counter in pyo3 monitoring whether this thread is attached to the interpreter.
@@ -321,7 +321,9 @@ impl ReferencePool {
 
     fn register_decref(&self, obj: NonNull<ffi::PyObject>) {
         self.pending_decrefs.lock().unwrap().push(obj);
-        self.dirty.store(true, Ordering::Relaxed);
+        if !self.dirty.swap(true, Ordering::Relaxed) {
+            DIRTY_POOLS.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     fn drop_deferred_references(&self, py: Python<'_>) {
@@ -348,6 +350,7 @@ impl ReferencePool {
             // Another thread is already dropping the references, so we can return early.
             return;
         }
+        DIRTY_POOLS.fetch_sub(1, Ordering::Relaxed);
 
         let mut pending_decrefs = self.pending_decrefs.lock().unwrap();
         if pending_decrefs.is_empty() {
@@ -371,21 +374,199 @@ unsafe impl Send for ReferencePool {}
 #[cfg(not(pyo3_disable_reference_pool))]
 unsafe impl Sync for ReferencePool {}
 
+// One pool per interpreter (M3.2, #10).
+//
+// A `Py<T>` dropped while detached is queued and decref'd on the next attach. A single
+// process-wide queue let interpreter B decref interpreter A's objects: A's pointer freed into
+// B's allocator (SIGABRT on macOS, silent heap corruption on glibc) and an unsynchronised write
+// to A's refcount while A ran under its own GIL (`subinterp-bench/BUG-POOL.md`).
+//
+// So each deferred decref goes to its owner's pool, and a pool is drained only by an attach to
+// its own interpreter, or emptied by that interpreter's teardown hook. The owner has to be known
+// when the object is queued (`owner_now`): at drain time it can no longer be recovered.
+
+/// Which pool a deferred decref belongs to: an interpreter's address, or [`MAIN_POOL`].
 #[cfg(not(pyo3_disable_reference_pool))]
-static POOL: OnceLock<ReferencePool> = OnceLock::new();
+type PoolKey = usize;
+
+/// The main interpreter's pool. A constant rather than its address: a thread with no thread
+/// state learns "main" from `home::foreign_target` without ever seeing the pointer, and the
+/// limited API has no `PyInterpreterState_Main`.
+#[cfg(not(pyo3_disable_reference_pool))]
+const MAIN_POOL: PoolKey = 1;
 
 #[cfg(not(pyo3_disable_reference_pool))]
-fn get_pool() -> &'static ReferencePool {
-    POOL.get_or_init(ReferencePool::new)
+static POOLS: Mutex<Vec<(PoolKey, Arc<ReferencePool>)>> = Mutex::new(Vec::new());
+
+/// Number of pools whose `dirty` flag is set. Zero is the common case, and then an attach costs
+/// one atomic load, as upstream's single pool did.
+#[cfg(not(pyo3_disable_reference_pool))]
+static DIRTY_POOLS: AtomicUsize = AtomicUsize::new(0);
+
+/// Bumped when a pool is removed, invalidating every thread's cached pool pointer.
+#[cfg(not(pyo3_disable_reference_pool))]
+static POOLS_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(not(pyo3_disable_reference_pool))]
+std::thread_local! {
+    /// `(key, generation, pool)`: this thread's last drained pool. The pointer stays valid while
+    /// the generation matches, because only a teardown removes a pool, and it bumps the
+    /// generation first.
+    static POOL_CACHE: Cell<(PoolKey, u64, *const ReferencePool)> =
+        const { Cell::new((0, 0, core::ptr::null())) };
+}
+
+#[cfg(not(pyo3_disable_reference_pool))]
+fn pool_key(interp: *mut ffi::PyInterpreterState) -> PoolKey {
+    // SAFETY: `interp` is a live interpreter; reading its id needs no GIL.
+    if unsafe { ffi::PyInterpreterState_GetID(interp) } == 0 {
+        MAIN_POOL
+    } else {
+        interp as PoolKey
+    }
+}
+
+/// The interpreter that owns an object dropped on this thread right now, while not attached.
+///
+/// 1. The thread has a thread state (it detached, e.g. inside `py.detach`): that thread
+///    state's interpreter. Re-attach on such threads was measured to land correctly
+///    (`subinterp-bench/attach_probe.py`), and the drop follows the same rule.
+/// 2. No thread state (a rayon / tokio / `std::thread` worker): this extension copy's home
+///    interpreter (M1.3), which is the main interpreter when the copy has only ever run there.
+/// 3. Otherwise (a copy loaded by several interpreters, or whose home is gone): unknown.
+#[cfg(not(pyo3_disable_reference_pool))]
+fn owner_now() -> Option<PoolKey> {
+    // SAFETY: always safe to call; returns null when there is no thread state.
+    let tstate = unsafe { ffi::PyGILState_GetThisThreadState() };
+    #[cfg(any(not(Py_LIMITED_API), Py_3_10))]
+    if !tstate.is_null() {
+        // SAFETY: `tstate` is non-null.
+        return Some(pool_key(unsafe { ffi::PyThreadState_GetInterpreter(tstate) }));
+    }
+    #[cfg(all(Py_LIMITED_API, not(Py_3_10)))]
+    let _ = tstate;
+    match crate::internal::home::foreign_target() {
+        crate::internal::home::ForeignTarget::Gilstate => Some(MAIN_POOL),
+        crate::internal::home::ForeignTarget::Home(interp) => Some(pool_key(interp)),
+        crate::internal::home::ForeignTarget::Ambiguous
+        | crate::internal::home::ForeignTarget::HomeGone => None,
+    }
+}
+
+/// The pool for `key`, created on first use.
+#[cfg(not(pyo3_disable_reference_pool))]
+fn pool_for(key: PoolKey) -> Arc<ReferencePool> {
+    let mut pools = POOLS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, pool)) = pools.iter().find(|(k, _)| *k == key) {
+        return pool.clone();
+    }
+    let pool = Arc::new(ReferencePool::new());
+    pools.push((key, pool.clone()));
+    pool
+}
+
+/// The pool of the thread that is dropping an object right now. Used by the unit tests, which
+/// call it on an attached main-interpreter thread.
+#[cfg(not(pyo3_disable_reference_pool))]
+fn get_pool() -> Arc<ReferencePool> {
+    pool_for(owner_now().expect("no owning interpreter for this thread"))
+}
+
+/// Queues a decref for an object dropped while not attached.
+#[cfg(not(pyo3_disable_reference_pool))]
+fn defer_decref(obj: NonNull<ffi::PyObject>) {
+    match owner_now() {
+        Some(key) => pool_for(key).register_decref(obj),
+        None => unknown_owner(),
+    }
+}
+
+/// A `Py<T>` dropped on a thread with no thread state, in an extension copy that several
+/// interpreters loaded (or whose home interpreter is gone): PyO3 cannot tell whose object it is.
+/// Decref'ing it in the wrong interpreter corrupts memory, and leaking it silently hides the
+/// bug, so this fails loudly, like the attach in the same situation (`AttachError`).
+///
+/// Except while this thread is already panicking: then the drop is fallout of a failure that
+/// is already being reported (typically that very attach panicking, and unwinding dropping the
+/// objects the closure held). Panicking again would abort the process, turning one loud error
+/// into a crash (measured: `pool_soak.py` shared, exit 134). So the object is leaked and the
+/// reason printed.
+#[cfg(not(pyo3_disable_reference_pool))]
+#[cold]
+fn unknown_owner() {
+    const MSG: &str = "a Py<T> was dropped on a thread that has no Python thread state (e.g. a \
+        rayon, tokio or std::thread worker), and this extension is loaded by more than one \
+        interpreter (or its interpreter is gone), so PyO3 cannot tell which interpreter owns \
+        the object. Decref'ing it in the wrong interpreter would corrupt memory. Drop it while \
+        attached, e.g. inside pyo3::sync::InterpreterHandle::attach, or give each interpreter \
+        its own copy of the extension";
+    if std::thread::panicking() {
+        std::eprintln!("{MSG} (this thread is already panicking, so the object is leaked)");
+        return;
+    }
+    panic!("{MSG}");
 }
 
 #[cfg_attr(pyo3_disable_reference_pool, inline(always))]
 #[cfg_attr(pyo3_disable_reference_pool, allow(unused_variables))]
 fn drop_deferred_references(py: Python<'_>) {
     #[cfg(not(pyo3_disable_reference_pool))]
-    if let Some(pool) = POOL.get() {
-        pool.drop_deferred_references(py);
+    if DIRTY_POOLS.load(Ordering::Relaxed) != 0 {
+        drop_deferred_references_slow(py);
     }
+}
+
+/// Drains the current interpreter's pool, if it has one.
+#[cfg(not(pyo3_disable_reference_pool))]
+#[cold]
+fn drop_deferred_references_slow(py: Python<'_>) {
+    // SAFETY: attached (`py`), so there is a current interpreter.
+    let key = pool_key(unsafe { ffi::PyInterpreterState_Get() });
+    let generation = POOLS_GENERATION.load(Ordering::Acquire);
+    let (cached_key, cached_generation, cached) = POOL_CACHE.with(Cell::get);
+    if cached_key == key && cached_generation == generation && !cached.is_null() {
+        // SAFETY: see `POOL_CACHE`; this thread is attached to the pool's interpreter, so its
+        // teardown cannot be running.
+        unsafe { &*cached }.drop_deferred_references(py);
+        return;
+    }
+    // Created if absent, so that "this interpreter has nothing queued" is cached too: otherwise
+    // every call here takes the `POOLS` lock for as long as some other interpreter's pool is dirty
+    // (measured +13 ns per `#[pyfunction]` call).
+    let pool = pool_for(key);
+    POOL_CACHE.with(|c| c.set((key, generation, Arc::as_ptr(&pool))));
+    pool.drop_deferred_references(py);
+}
+
+/// Called from the per-interpreter teardown hook, attached to the interpreter being destroyed:
+/// removes its pool and applies the decrefs still queued in it.
+pub(crate) fn drain_pool_on_teardown(py: Python<'_>) {
+    #[cfg(not(pyo3_disable_reference_pool))]
+    {
+        // SAFETY: attached (`py`).
+        let key = pool_key(unsafe { ffi::PyInterpreterState_Get() });
+        // Loop: a decref can run a destructor that drops another `Py<T>` of this interpreter.
+        loop {
+            let pool = {
+                let mut pools = POOLS.lock().unwrap_or_else(|e| e.into_inner());
+                match pools.iter().position(|(k, _)| *k == key) {
+                    Some(i) => pools.swap_remove(i).1,
+                    None => break,
+                }
+            };
+            POOLS_GENERATION.fetch_add(1, Ordering::Release);
+            if pool.dirty.swap(false, Ordering::Relaxed) {
+                DIRTY_POOLS.fetch_sub(1, Ordering::Relaxed);
+            }
+            let decrefs = mem::take(&mut *pool.pending_decrefs.lock().unwrap());
+            for ptr in decrefs {
+                // SAFETY: queued for this interpreter, which this thread is attached to.
+                unsafe { ffi::Py_DECREF(ptr.as_ptr()) };
+            }
+        }
+    }
+    #[cfg(pyo3_disable_reference_pool)]
+    let _ = py;
 }
 
 /// A guard which can be used to temporarily detach from the interpreter and restore on `Drop`.
@@ -410,10 +591,7 @@ impl Drop for SuspendAttach {
             ffi::PyEval_RestoreThread(self.tstate);
 
             // Update counts of `Py<T>` that were dropped while not attached.
-            #[cfg(not(pyo3_disable_reference_pool))]
-            if let Some(pool) = POOL.get() {
-                pool.drop_deferred_references(Python::assume_attached());
-            }
+            drop_deferred_references(Python::assume_attached());
         }
     }
 }
@@ -465,7 +643,7 @@ impl Drop for ForbidAttaching {
 pub unsafe fn register_decref(obj: NonNull<ffi::PyObject>) {
     #[cfg(not(pyo3_disable_reference_pool))]
     {
-        get_pool().register_decref(obj);
+        defer_decref(obj);
     }
     #[cfg(all(
         pyo3_disable_reference_pool,

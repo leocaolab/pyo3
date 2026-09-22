@@ -380,6 +380,45 @@ fn datetime_capi(py: Python<'_>) -> (usize, usize) {
     }
 }
 
+/// M3.2 (#10): drop `obj` on a fresh std::thread (no Python thread state). Returns "ok", or the
+/// panic message if PyO3 refused.
+#[pyfunction]
+fn drop_on_foreign_thread(obj: Py<PyAny>) -> String {
+    match std::thread::spawn(move || drop(obj)).join() {
+        Ok(()) => "ok".to_string(),
+        Err(e) => {
+            let msg = e
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
+                .unwrap_or_default();
+            format!("panicked: {}", &msg[..msg.len().min(90)])
+        }
+    }
+}
+
+/// M3.2: drop `obj` inside `py.detach` (this thread keeps its detached thread state).
+#[pyfunction]
+fn drop_during_detach(py: Python<'_>, obj: Py<PyAny>) {
+    py.detach(move || drop(obj));
+}
+
+/// M3.2: drop `obj` inside `py.detach`, stay detached for `ms`, and read its refcount before and
+/// after, still detached. A decrease means another interpreter applied this interpreter's decref.
+#[pyfunction]
+fn detach_race(py: Python<'_>, obj: Py<PyAny>, ms: u64) -> (isize, isize) {
+    let raw = obj.as_ptr() as usize;
+    // SAFETY: probe only; `raw` stays alive (the caller holds a reference).
+    let before = unsafe { pyo3::ffi::Py_REFCNT(raw as *mut pyo3::ffi::PyObject) };
+    let during = py.detach(move || {
+        drop(obj);
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+        // SAFETY: probe only; a racy read of the refcount field of a live object.
+        unsafe { pyo3::ffi::Py_REFCNT(raw as *mut pyo3::ffi::PyObject) }
+    });
+    (before, during)
+}
+
 #[pymodule] fn abi3t(m: &Bound<'_, PyModule>) -> PyResult<()> {
     #[cfg(feature = "submodule")]
     m.add_wrapped(wrap_pymodule!(inner))?;
@@ -400,6 +439,9 @@ fn datetime_capi(py: Python<'_>) -> (usize, usize) {
     m.add_function(wrap_pyfunction!(once_lock_heap_check, m)?)?;
     m.add_function(wrap_pyfunction!(once_lock_ns, m)?)?;
     m.add_function(wrap_pyfunction!(conv_path, m)?)?;
+    m.add_function(wrap_pyfunction!(drop_on_foreign_thread, m)?)?;
+    m.add_function(wrap_pyfunction!(drop_during_detach, m)?)?;
+    m.add_function(wrap_pyfunction!(detach_race, m)?)?;
     m.add_function(wrap_pyfunction!(conv_ip, m)?)?;
     m.add_function(wrap_pyfunction!(conv_delta, m)?)?;
     m.add_function(wrap_pyfunction!(conv_utc, m)?)?;

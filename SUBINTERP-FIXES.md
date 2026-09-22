@@ -271,6 +271,31 @@ layout as an opt-in cfg. Benchmark it before choosing a default.
 A pool is drained only by an attach to **its** interpreter, and emptied in
 that interpreter's teardown hook.
 
+### M3 status (2026-09-22)
+
+| item | status |
+|---|---|
+| M3.1 dead code (#9) | done (`2a9c032`). The pool is byte-identical to upstream again, the base for M3.2 |
+| M3.2 per-interpreter pools (#10) | done. One pool per interpreter in `POOLS`, keyed by interpreter (the main interpreter under a fixed key). The owner is fixed at enqueue (`owner_now`): the thread's thread state, else HOME (M1.3), else unknown. A pool is drained only by an attach to its own interpreter, and emptied by that interpreter's teardown hook (under `AssumeAttached`). Fast path: one global dirty-pool counter, so an idle attach costs what upstream's does |
+| unknown owner | panics with an explanation, like `AttachError`. **While the thread is already panicking** (the drop is fallout of an attach that just failed loudly), it prints the reason and leaks the object instead: a second panic would abort, and that was measured turning `pool_soak.py` shared from a Python `PanicException` into exit 134 |
+| M3.3 policy (#11) | open: fail-loudly is implemented; the `Py<T>`-carries-interpreter layout option is not prototyped |
+
+Evidence (3.14.7 macOS):
+
+- `pool_probe.py` (2 interpreters, 5 rounds per cell):
+
+  | drop while not attached | upstream shared .so | fork shared .so | copies (both) |
+  |---|---|---|---|
+  | on a thread with no thread state | **decref applied by the other interpreter** 5/5 | loud 5/5 | queued, applied by the owner 5/5 |
+  | inside `py.detach`, other interpreter attaches meanwhile | **applied by the other interpreter** 5/5 | queued until the owner re-attaches 5/5 | same 5/5 |
+  | inside `py.detach`, nothing else running | owner, on return | owner, on return | owner, on return |
+
+- `pool_soak.py` N=8 write, 90 s: copies 3/3 + 1/1 clean (≈0.95 M writes each, 0 wrong); pre-M3.2 copies 3/3 clean too. The pool is a static, so a copy was already its own pool. Shared: M1.3 fails the worker-thread attach first, so each interpreter gets a `PanicException` (8/8), with no abort. N=1 control: clean. N=8 collect copies: clean.
+- `attach_cost.py` (ns per `#[pyfunction]` call): idle 10.2 (upstream 10.9); with another interpreter's pool dirty 13.1 (upstream 10.6, but upstream's number is what it costs to wrongly drain that pool on the first call).
+- `leak.py` 300 rounds, before vs after M3.2: 0.2 vs 0.2–0.3 MB per thousand interpreters. Unchanged.
+- polars bug B and the write check on the new build: unchanged (80/80; copies 16/16).
+- Not yet run: ASAN on Linux.
+
 ### M3 acceptance
 
 - `subinterp-bench/pool_soak.py` at N = 8, write mode: 10/10 clean on macOS

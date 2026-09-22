@@ -247,3 +247,24 @@ matrix.py               只问"能不能加载/隔离到位"      → 不跑长�
 **这套基准的每一项都在"把机制用起来",而这个 bug 在"两个解释器同时把它用坏"里。**
 它需要:≥4 个解释器 + 各自持续跑 + 有 Python 回调制造 detach 风暴 + 不销毁不退出。
 这四个条件的交集,已有的脚本一个都不覆盖。`pool_soak.py` 就是补这个交集的。
+
+
+---
+
+## 八、修法(M3.2,#10)—— 已落地
+
+**每个解释器一个池,归属在入池那一刻定下来。** 这正是第五节说的那个方向。
+
+- 归属(`owner_now`,无 GIL 可调):
+  1. 线程有 thread state(比如在 `py.detach` 里)→ 用那个 thread state 所属的解释器;
+  2. 没有 thread state(rayon / tokio / std::thread)→ 用这份 .so 的 HOME(M1.3)。
+     只在主解释器跑过的拷贝就是主解释器,行为和上游一样;
+  3. 共享 .so 被多个解释器加载、或 HOME 已销毁 → **分辨不出**:大声 panic。
+     如果线程已经在 panic 中(典型情况:attach 刚刚大声失败,展开栈时 drop 了闭包里的对象),
+     就打印原因并泄漏,不再二次 panic。二次 panic 会 abort,等于把一个大声错误变成崩溃。
+- 一个池**只**被 attach 到它自己解释器的线程冲刷,解释器销毁时由 teardown hook 清空。
+- 快路径是一个全局"脏池个数"计数:没有待释放对象时,attach 的开销和上游一样。
+
+实测(`pool_probe.py`、`pool_soak.py`、`attach_cost.py`、`leak.py`)见
+`SUBINTERP-FIXES.md` 的 "M3 status"。一句话:上游共享 .so 在两条路径上都是 5/5
+由**别的解释器**执行 decref,fork 在两条路径上都是 0/5。
