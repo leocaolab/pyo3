@@ -269,9 +269,40 @@ fn deferred_decref_is_applied_by_its_own_interpreter_only() {
 // Ledger #2, #5, #6: the per-interpreter registry. Moved from `src/sync/per_interpreter.rs`
 // unit tests unchanged in what they assert.
 
-/// The key `PerInterpreterCell` keeps its registry under in the interpreter dict
-/// (`REGISTRY_KEY` in `src/sync/per_interpreter.rs`).
-const REGISTRY_KEY: &std::ffi::CStr = c"_pyo3_per_interpreter";
+/// The key `PerInterpreterCell` keeps this copy's registry under in the interpreter dict:
+/// `_pyo3_per_interpreter.<tag>`, where the tag is per extension copy (`keys()` in
+/// `src/sync/per_interpreter.rs`). This test binary is one copy, so there is exactly one.
+///
+/// # Safety
+/// The caller holds the GIL of the interpreter that owns `dict`.
+unsafe fn registry_key(dict: *mut ffi::PyObject) -> std::ffi::CString {
+    let mut found = Vec::new();
+    let (mut pos, mut k, mut v) = (0, std::ptr::null_mut(), std::ptr::null_mut());
+    // SAFETY: the caller holds the GIL; `dict` is a dict.
+    while unsafe { ffi::PyDict_Next(dict, &mut pos, &mut k, &mut v) } != 0 {
+        // SAFETY: as above; a non-str key yields NULL, which is skipped.
+        let name = unsafe { ffi::PyUnicode_AsUTF8(k) };
+        if name.is_null() {
+            // SAFETY: the caller holds the GIL.
+            unsafe { ffi::PyErr_Clear() };
+            continue;
+        }
+        // SAFETY: CPython returns a NUL-terminated UTF-8 buffer owned by the key.
+        let name = unsafe { std::ffi::CStr::from_ptr(name) }.to_owned();
+        let text = name.to_string_lossy();
+        if let Some(tag) = text.strip_prefix("_pyo3_per_interpreter.") {
+            if !tag.contains('.') {
+                found.push(name);
+            }
+        }
+    }
+    assert_eq!(
+        found.len(),
+        1,
+        "expected exactly one registry key, found {found:?}"
+    );
+    found.pop().unwrap()
+}
 
 /// Drops this interpreter's registry the way CPython does at finalization, **including the part
 /// that matters**: from a thread PyO3 has never attached.
@@ -299,11 +330,12 @@ fn drop_registry_as_cpython_would(_py: Python<'_>) {
         ffi::PyEval_RestoreThread(ts);
         let dict = ffi::PyInterpreterState_GetDict(ffi::PyInterpreterState_Get());
         assert!(!dict.is_null());
+        let key = registry_key(dict);
         assert!(
-            !ffi::PyDict_GetItemString(dict, REGISTRY_KEY.as_ptr()).is_null(),
-            "no registry under {REGISTRY_KEY:?}: has REGISTRY_KEY changed?"
+            !ffi::PyDict_GetItemString(dict, key.as_ptr()).is_null(),
+            "no registry under {key:?}"
         );
-        if ffi::PyDict_DelItemString(dict, REGISTRY_KEY.as_ptr()) < 0 {
+        if ffi::PyDict_DelItemString(dict, key.as_ptr()) < 0 {
             ffi::PyErr_Clear();
         }
         ffi::PyThreadState_Clear(ts);
@@ -413,3 +445,4 @@ fn neighbouring_cells_have_distinct_slots() {
         assert!(PAIR.b.get(py).unwrap().bind(py).eq("second").unwrap());
     });
 }
+

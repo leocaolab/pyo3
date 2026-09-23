@@ -38,18 +38,51 @@ use core::cell::Cell;
 use core::ffi::{c_void, CStr};
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-/// Key under which an interpreter's registry lives in its interpreter dict.
-const REGISTRY_KEY: &CStr = c"_pyo3_per_interpreter";
-
 /// Capsule name for the registry. CPython compares this when unwrapping, so it must be stable.
 const CAPSULE_NAME: &CStr = c"pyo3.per_interpreter.registry";
 
-/// Marks that this interpreter's teardown hook has been registered.
-const HOOK_KEY: &CStr = c"_pyo3_per_interpreter_hook";
+/// Name of the teardown hook function, as `atexit` reports it. Only a label.
+const HOOK_NAME: &CStr = c"_pyo3_per_interpreter_hook";
 
-/// `gc.collect`, resolved when the hook is registered, so the hook itself imports nothing while
-/// `Py_EndInterpreter` is tearing the interpreter down (M4.1, #12).
-const GC_COLLECT_KEY: &CStr = c"_pyo3_per_interpreter_gc_collect";
+/// The interpreter-dict keys this extension copy uses.
+///
+/// Every extension `.so` carries its own copy of PyO3's statics: its own [`NEXT_INDEX`], its own
+/// [`REGISTRIES`], its own teardown hook and reference pools. The keys must therefore be per copy
+/// too. With one fixed key, the second PyO3 extension loaded into an interpreter found the first
+/// one's registry and read its slots by its own indices: the first extension's type objects came
+/// back as the second's — measured as a segfault on importing two fork-built extensions
+/// (pyronova's engine, then polars) in one interpreter, main or sub, in either order. The same
+/// fixed hook key meant only the first copy's teardown hook was ever registered, so the second
+/// copy's registry and deferred decrefs were never released at `Py_EndInterpreter`.
+///
+/// The suffix is the address of a static inside this copy. A physically separate copy of the
+/// same library (a per-worker clone) is mapped at another address and so gets its own keys; the
+/// same copy loaded by several interpreters uses the same keys in each, which is what they are for.
+struct Keys {
+    /// Where the registry capsule lives.
+    registry: alloc::ffi::CString,
+    /// Marks that this copy's teardown hook is registered with this interpreter's `atexit`.
+    hook: alloc::ffi::CString,
+    /// `gc.collect`, resolved when the hook is registered, so the hook itself imports nothing
+    /// while `Py_EndInterpreter` is tearing the interpreter down (M4.1, #12).
+    gc_collect: alloc::ffi::CString,
+}
+
+fn keys() -> &'static Keys {
+    static KEYS: std::sync::OnceLock<Keys> = std::sync::OnceLock::new();
+    KEYS.get_or_init(|| {
+        let tag = &NEXT_INDEX as *const AtomicUsize as usize;
+        let key = |what: &str| {
+            alloc::ffi::CString::new(alloc::format!("_pyo3_per_interpreter{what}.{tag:x}"))
+                .expect("no interior NUL in a formatted key")
+        };
+        Keys {
+            registry: key(""),
+            hook: key("_hook"),
+            gc_collect: key("_gc_collect"),
+        }
+    })
+}
 
 /// Hands out one index per cell — one per `#[pyclass]` or `create_exception!` in the program,
 /// assigned in first-use order.
@@ -385,7 +418,7 @@ unsafe fn find_registry() -> *mut Registry {
         if interp_dict.is_null() {
             return core::ptr::null_mut();
         }
-        let capsule = ffi::PyDict_GetItemString(interp_dict, REGISTRY_KEY.as_ptr());
+        let capsule = ffi::PyDict_GetItemString(interp_dict, keys().registry.as_ptr());
         if capsule.is_null() {
             return core::ptr::null_mut();
         }
@@ -424,7 +457,7 @@ unsafe fn ensure_registry(_py: Python<'_>) -> *mut Registry {
             drop(Box::from_raw(registry));
             return core::ptr::null_mut();
         }
-        let rc = ffi::PyDict_SetItemString(interp_dict, REGISTRY_KEY.as_ptr(), capsule);
+        let rc = ffi::PyDict_SetItemString(interp_dict, keys().registry.as_ptr(), capsule);
         ffi::Py_DECREF(capsule); // the dict holds the surviving reference
         if rc < 0 {
             ffi::PyErr_Clear();
@@ -483,7 +516,7 @@ unsafe extern "C" fn teardown(
         }
         let interp_dict = ffi::PyInterpreterState_GetDict(ffi::PyInterpreterState_Get());
         if !interp_dict.is_null() {
-            if ffi::PyDict_DelItemString(interp_dict, REGISTRY_KEY.as_ptr()) < 0 {
+            if ffi::PyDict_DelItemString(interp_dict, keys().registry.as_ptr()) < 0 {
                 ffi::PyErr_Clear();
             }
             // Three passes, not one: collecting a type object makes what it referenced unreachable in
@@ -491,7 +524,7 @@ unsafe extern "C" fn teardown(
             // three recover all of it.
             //
             // `gc.collect` was stored when the hook was registered: no import here, mid-teardown.
-            let collect = ffi::PyDict_GetItemString(interp_dict, GC_COLLECT_KEY.as_ptr());
+            let collect = ffi::PyDict_GetItemString(interp_dict, keys().gc_collect.as_ptr());
             if !collect.is_null() {
                 ffi::Py_INCREF(collect);
                 for _ in 0..3 {
@@ -515,7 +548,7 @@ struct TeardownDef(ffi::PyMethodDef);
 unsafe impl Sync for TeardownDef {}
 
 static TEARDOWN_DEF: TeardownDef = TeardownDef(ffi::PyMethodDef {
-    ml_name: HOOK_KEY.as_ptr(),
+    ml_name: HOOK_NAME.as_ptr(),
     ml_meth: ffi::PyMethodDefPointer {
         PyCFunction: teardown,
     },
@@ -530,7 +563,7 @@ static TEARDOWN_DEF: TeardownDef = TeardownDef(ffi::PyMethodDef {
 unsafe fn register_teardown_hook(interp_dict: *mut ffi::PyObject) {
     // SAFETY: the caller is attached and `interp_dict` is the current interpreter's dict.
     unsafe {
-        if !ffi::PyDict_GetItemString(interp_dict, HOOK_KEY.as_ptr()).is_null() {
+        if !ffi::PyDict_GetItemString(interp_dict, keys().hook.as_ptr()).is_null() {
             return;
         }
         let atexit = ffi::PyImport_ImportModule(c"atexit".as_ptr());
@@ -565,7 +598,7 @@ unsafe fn register_teardown_hook(interp_dict: *mut ffi::PyObject) {
         if !name.is_null() {
             ffi::Py_DECREF(name);
         }
-        if ffi::PyDict_SetItemString(interp_dict, HOOK_KEY.as_ptr(), callable) < 0 {
+        if ffi::PyDict_SetItemString(interp_dict, keys().hook.as_ptr(), callable) < 0 {
             ffi::PyErr_Clear();
         }
         // Resolve `gc.collect` now, while the interpreter is healthy; the hook only calls it.
@@ -577,7 +610,7 @@ unsafe fn register_teardown_hook(interp_dict: *mut ffi::PyObject) {
             if collect.is_null() {
                 ffi::PyErr_Clear();
             } else {
-                if ffi::PyDict_SetItemString(interp_dict, GC_COLLECT_KEY.as_ptr(), collect) < 0 {
+                if ffi::PyDict_SetItemString(interp_dict, keys().gc_collect.as_ptr(), collect) < 0 {
                     ffi::PyErr_Clear();
                 }
                 ffi::Py_DECREF(collect);

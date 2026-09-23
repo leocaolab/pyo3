@@ -98,5 +98,12 @@ for b in ("sm_base", "sm_fork", "sm_base_abi3", "sm_fork_abi3"):
             if want not in p.stdout:
                 failures.append(f"submodule {b}: missing {want!r}")
 
+# Ledger #21: two PyO3 extension copies in one interpreter each keep their own registry.
+# columns: build, place, verdict. Fork-only defect: the upstream control has no registry, so it
+# is correct as well; the fork rows are proven by mutation (revert the fix -> crash).
+rows = run("two_copies.py", "4")
+for place in ("main", "sub"):
+    expect("two_copies", rows, "so_fork", place, 2, r"^correct$")
+
 print("\n" + ("\n".join("FAIL " + f for f in failures) if failures else "all verdicts as expected"))
 sys.exit(1 if failures else 0)
