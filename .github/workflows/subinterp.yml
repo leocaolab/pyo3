@@ -1,0 +1,93 @@
+# CI for the sub-interpreter fork (M5.1, leocaolab/pyo3#14).
+#
+# Upstream's ci.yml only runs on pull_request / merge_group / workflow_dispatch, so
+# pushes to this branch ran nothing. This file is separate from upstream's workflows
+# so rebasing onto upstream never conflicts with it.
+name: subinterp
+
+on:
+  push:
+    branches: [subinterp-per-interpreter-state]
+    tags: ["subinterp-*"]
+  pull_request:
+    branches: [subinterp-per-interpreter-state]
+  workflow_dispatch:
+
+concurrency:
+  group: subinterp-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  unit:
+    name: cargo test --lib (${{ matrix.os }}, ${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ["3.13", "3.14"]   # minimum supported Python is 3.13
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: unit-${{ matrix.python }}
+      - name: unit tests (parallel, as a regression for the main-registry teardown bug)
+        run: cargo test --lib --release
+        env:
+          PYO3_PYTHON: python
+      - name: unit tests (serial)
+        run: cargo test --lib --release -- --test-threads=1
+        env:
+          PYO3_PYTHON: python
+
+  abi3:
+    name: abi3-py310 build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: abi3
+      - run: cargo check --release --features abi3-py310
+        env:
+          PYO3_PYTHON: python
+
+  probes:
+    name: sub-interpreter probes (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # the upstream control is built from dfdbc46
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: subinterp-bench/probe
+          key: probes
+      - name: upstream control worktree
+        run: git worktree add "$RUNNER_TEMP/pyo3-base" dfdbc46
+      - name: build probe matrix (upstream vs fork, default/abi3, top-level/submodule)
+        run: bash subinterp-bench/build.sh
+        env:
+          PYO3_PYTHON: python
+          BASE: ${{ runner.temp }}/pyo3-base
+      - name: verdicts (fork correct, upstream control still shows each bug)
+        run: python subinterp-bench/ci_verdicts.py
