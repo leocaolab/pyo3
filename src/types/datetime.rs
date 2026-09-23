@@ -12,9 +12,10 @@ use crate::ffi::{
     self, PyDateTime_CAPI, PyDateTime_DATE_GET_FOLD, PyDateTime_DATE_GET_HOUR,
     PyDateTime_DATE_GET_MICROSECOND, PyDateTime_DATE_GET_MINUTE, PyDateTime_DATE_GET_SECOND,
     PyDateTime_DELTA_GET_DAYS, PyDateTime_DELTA_GET_MICROSECONDS, PyDateTime_DELTA_GET_SECONDS,
-    PyDateTime_GET_DAY, PyDateTime_GET_MONTH, PyDateTime_GET_YEAR,
+    PyDateTime_FromTimestamp, PyDateTime_GET_DAY, PyDateTime_GET_MONTH, PyDateTime_GET_YEAR,
     PyDateTime_IMPORT, PyDateTime_TIME_GET_FOLD, PyDateTime_TIME_GET_HOUR,
     PyDateTime_TIME_GET_MICROSECOND, PyDateTime_TIME_GET_MINUTE, PyDateTime_TIME_GET_SECOND,
+    PyDate_FromTimestamp,
 };
 #[cfg(all(Py_3_10, not(Py_LIMITED_API)))]
 use crate::ffi::{PyDateTime_DATE_GET_TZINFO, PyDateTime_TIME_GET_TZINFO, Py_IsNone};
@@ -32,47 +33,18 @@ use crate::{Borrowed, Bound, IntoPyObject, PyAny, Python};
 #[cfg(not(Py_LIMITED_API))]
 use core::ffi::c_int;
 
-/// This interpreter's `datetime` C-API table.
-///
-/// Per interpreter, not pyo3-ffi's process-wide `PyDateTimeAPI()`: on Python 3.12 the C
-/// `_datetime` module loads only in the first interpreter that imports it, and every other
-/// isolated sub-interpreter gets the pure-Python `_pydatetime`, with its own types and no C API.
-/// The process-wide table then built the *first* interpreter's objects in every other one
-/// (measured, `subinterp-bench/conv_probe.py`). On 3.13+ every interpreter gets the same table,
-/// so this changes nothing there.
-///
-/// Where this interpreter has no C API, this is an error that says why, never another
-/// interpreter's table.
 #[cfg(not(Py_LIMITED_API))]
 fn ensure_datetime_api(py: Python<'_>) -> PyResult<&'static PyDateTime_CAPI> {
-    static API: PyOnceLock<usize> = PyOnceLock::new();
-    let table = API.get_or_try_init(py, || {
-        // SAFETY: attached; the capsule name is a valid C string.
-        let table = unsafe { ffi::PyCapsule_Import(ffi::PyDateTime_CAPSULE_NAME.as_ptr(), 1) };
-        if table.is_null() {
-            let cause = PyErr::fetch(py);
-            let err = crate::exceptions::PyRuntimeError::new_err(DATETIME_API_UNAVAILABLE);
-            err.set_cause(py, Some(cause));
-            return Err(err);
+    if let Some(api) = unsafe { pyo3_ffi::PyDateTimeAPI().as_ref() } {
+        Ok(api)
+    } else {
+        unsafe {
+            PyDateTime_IMPORT();
+            pyo3_ffi::PyDateTimeAPI().as_ref()
         }
-        // Keep populating pyo3-ffi's process-wide table, which direct FFI users read.
-        // SAFETY: attached.
-        unsafe { PyDateTime_IMPORT() };
-        Ok(table as usize)
-    })?;
-    // SAFETY: a `PyDateTime_CAPI` owned by this interpreter's `datetime` module, alive as long as
-    // the interpreter, which is as long as this lock holds it.
-    Ok(unsafe { &*(*table as *const PyDateTime_CAPI) })
+        .ok_or_else(|| PyErr::fetch(py))
+    }
 }
-
-#[cfg(all(not(Py_LIMITED_API), Py_3_12, not(Py_3_13)))]
-const DATETIME_API_UNAVAILABLE: &str = "the `datetime` C API is not available in this \
-    interpreter. On Python 3.12 the C `_datetime` module loads only in the first interpreter that \
-    imports it; other isolated sub-interpreters get the pure-Python `_pydatetime`, which has no C \
-    API. Use Python 3.13+, or import `datetime` first in the interpreter that uses it";
-#[cfg(all(not(Py_LIMITED_API), not(all(Py_3_12, not(Py_3_13)))))]
-const DATETIME_API_UNAVAILABLE: &str =
-    "the `datetime` C API is not available in this interpreter";
 
 #[cfg(not(Py_LIMITED_API))]
 fn expect_datetime_api(py: Python<'_>) -> &'static PyDateTime_CAPI {
@@ -92,7 +64,7 @@ fn expect_datetime_api(py: Python<'_>) -> &'static PyDateTime_CAPI {
 // These functions must only be called when the GIL is held!
 #[cfg(not(Py_LIMITED_API))]
 macro_rules! ffi_fun_with_autoinit {
-    ($(#[$outer:meta] unsafe fn $name: ident($arg: ident: *mut PyObject) -> $ret: ty => $field: ident;)*) => {
+    ($(#[$outer:meta] unsafe fn $name: ident($arg: ident: *mut PyObject) -> $ret: ty;)*) => {
         $(
             #[$outer]
             #[allow(non_snake_case)]
@@ -100,8 +72,9 @@ macro_rules! ffi_fun_with_autoinit {
             ///
             /// Must only be called while the GIL is held
             unsafe fn $name($arg: *mut crate::ffi::PyObject) -> $ret {
-                let api = expect_datetime_api(unsafe { Python::assume_attached() });
-                unsafe { crate::ffi::PyObject_TypeCheck($arg, api.$field) as c_int }
+
+                let _ = ensure_datetime_api(unsafe { Python::assume_attached() });
+                unsafe { crate::ffi::$name($arg) }
             }
         )*
 
@@ -112,19 +85,19 @@ macro_rules! ffi_fun_with_autoinit {
 #[cfg(not(Py_LIMITED_API))]
 ffi_fun_with_autoinit! {
     /// Check if `op` is a `PyDateTimeAPI.DateType` or subtype.
-    unsafe fn PyDate_Check(op: *mut PyObject) -> c_int => DateType;
+    unsafe fn PyDate_Check(op: *mut PyObject) -> c_int;
 
     /// Check if `op` is a `PyDateTimeAPI.DateTimeType` or subtype.
-    unsafe fn PyDateTime_Check(op: *mut PyObject) -> c_int => DateTimeType;
+    unsafe fn PyDateTime_Check(op: *mut PyObject) -> c_int;
 
     /// Check if `op` is a `PyDateTimeAPI.TimeType` or subtype.
-    unsafe fn PyTime_Check(op: *mut PyObject) -> c_int => TimeType;
+    unsafe fn PyTime_Check(op: *mut PyObject) -> c_int;
 
     /// Check if `op` is a `PyDateTimeAPI.DetaType` or subtype.
-    unsafe fn PyDelta_Check(op: *mut PyObject) -> c_int => DeltaType;
+    unsafe fn PyDelta_Check(op: *mut PyObject) -> c_int;
 
     /// Check if `op` is a `PyDateTimeAPI.TZInfoType` or subtype.
-    unsafe fn PyTZInfo_Check(op: *mut PyObject) -> c_int => TZInfoType;
+    unsafe fn PyTZInfo_Check(op: *mut PyObject) -> c_int;
 }
 
 // Access traits
@@ -272,10 +245,11 @@ impl PyDate {
         {
             let time_tuple = PyTuple::new(py, [timestamp])?;
 
-            let api = ensure_datetime_api(py)?;
+            // safety ensure that the API is loaded
+            let _api = ensure_datetime_api(py)?;
 
             unsafe {
-                (api.Date_FromTimestamp)(api.DateType, time_tuple.as_ptr())
+                PyDate_FromTimestamp(time_tuple.as_ptr())
                     .assume_owned_or_err(py)
                     .cast_into_unchecked()
             }
@@ -441,10 +415,11 @@ impl PyDateTime {
         {
             let args = (timestamp, tzinfo).into_pyobject(py)?;
 
-            let api = ensure_datetime_api(py)?;
+            // safety ensure API is loaded
+            let _api = ensure_datetime_api(py)?;
 
             unsafe {
-                (api.DateTime_FromTimestamp)(api.DateTimeType, args.as_ptr(), core::ptr::null_mut())
+                PyDateTime_FromTimestamp(args.as_ptr())
                     .assume_owned_or_err(py)
                     .cast_into_unchecked()
             }

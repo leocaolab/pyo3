@@ -193,7 +193,7 @@ on 3.12.13, 3.13.15 and 3.14.7 (macOS).
 | every `PyOnceLock` static: 53 declarations in `src/` (builtin type caches in `types/*.rs`, `pathlib`/`ipaddress`/`decimal`/`uuid`/`zoneinfo`/`collections.abc` classes in conversions, `ImportedExceptionTypeObject`, `err_state`, `get_slot`, `coroutine/waker`) plus macro-generated enum `SINGLETON` and `FREELIST` | Python objects | per interpreter (M2.2) | `conv_probe.py`: `PathBuf` → own `pathlib.Path`, `Ipv4Addr` → own `IPv4Address`: fork 4/4 on every build and deploy; upstream shared .so 1/4. `cache_probe.py`: own `sys` 4/4 |
 | `Interned` / `intern!` | `PyString` | per interpreter (M2.1) | `cache_probe.py` 4/4 |
 | `LazyTypeObject` (`value`, `fully_initialized_type`, `initializing_threads`), `ModuleDef.module` | type / module objects, init bookkeeping | per interpreter (`PerInterpreterCell`) | `initializing_threads` fixed in M2.2 (deadlock) |
-| **pyo3-ffi `PyDateTimeAPI_impl`** (`AtomicPtr<PyDateTime_CAPI>`), read by PyO3's datetime types, `from_timestamp`, `PyTzInfo::utc` | pointer to one interpreter's datetime C-API table | **was wrong on 3.12. Fixed:** PyO3 now keeps the table per interpreter (`ensure_datetime_api`, `src/types/datetime.rs`). The 3.12 cause is CPython's: C `_datetime` loads only in the first interpreter that imports it, and every other isolated sub-interpreter gets the pure-Python `_pydatetime` with its own heap types and no capsule. PyO3 then built the first interpreter's `timedelta` in every other interpreter. Now it raises `RuntimeError` saying why, with CPython's error as the cause | 3.12 fork before: `timedelta`/`utc` own object 1/4, 4 distinct `timedelta` types, `utc` mortal. After: the 1 interpreter with C `_datetime` is correct, the other 3 raise the explanatory error. 3.13/3.14: one shared, immortal table, 4/4 before and after. The ffi global is kept for direct FFI users, and on 3.12 it is still the first interpreter's |
+| pyo3-ffi `PyDateTimeAPI_impl` (`AtomicPtr<PyDateTime_CAPI>`), read by PyO3's datetime types | pointer to one interpreter's datetime C-API table | **safe on the supported versions (3.13+), left process-wide.** 3.13/3.14: every interpreter gets the same immortal table (4/4, shared and copies, full API). 3.12 would be wrong (C `_datetime` loads only in the first interpreter; others get pure-Python `_pydatetime` with no C API, so PyO3 built the first interpreter's `timedelta` in the others, 1/4 correct). A per-interpreter table was written for that (`e4174d8`) and **reverted**: Pyronova and SkyTrade require Python ≥ 3.13, where it changes nothing and costs a lookup per conversion | `conv_probe.py` on 3.12.13 / 3.13.15 / 3.14.7 |
 | pyo3-ffi `static mut PyExc_*`, `Py*_Type` (CPython's exported static builtin types and exceptions) | CPython-owned static objects | shared by CPython by design, safe | immortal in every interpreter on 3.12, 3.13, 3.14 (`conv_probe.py`, last column) |
 | `internal/state.rs` `POOL` (`ReferencePool`) | deferred decrefs from all interpreters | **wrong**. Owned by M3 (#9–#11) | `BUG-POOL.md` |
 | `internal/home.rs` `STATE` | home interpreter pointer + flags | deliberately per `.so` copy (M1.3) | `attach_probe.py` |
@@ -203,11 +203,10 @@ on 3.12.13, 3.13.15 and 3.14.7 (macOS).
 | `interpreter_lifecycle.rs` `START` (`Once`) | "Python initialized" | process-wide by nature | — |
 | macro-generated `ITEMS`, `INTRINSIC_ITEMS`, `_PYO3_DEF` (`PyFunctionDef`), `SLOTS`/`SECONDARY_SLOTS`, introspection fragments, `PyMethodDef` statics | static C/Rust data (method tables, slot arrays) | no Python objects | — |
 
-Result: apart from `POOL` (M3), there is no process-level PyO3 cache left that
-hands one interpreter's object to another. The one new defect this audit found
-(datetime on 3.12) is fixed. Direct FFI users still share pyo3-ffi's global
-datetime table. That is pyo3-ffi's public API and it cannot be per interpreter
-without a `Python` token, so it is documented here, not changed.
+Result: on the supported versions (Python ≥ 3.13), and apart from `POOL` (M3),
+there is no process-level PyO3 cache left that hands one interpreter's object to
+another. The one version-specific defect (datetime on 3.12) is outside the
+supported range.
 
 ### M2.4 Correct the docs
 
@@ -222,7 +221,7 @@ it, and link the measurement.
 | M2.1 `Interned` (#5) | done (`3c5d769`) |
 | M2.2 `PyOnceLock` (#6) | done. `cache_probe.py`, N=4, 3.14 macOS: a `static PyOnceLock` holding `sys` gives each interpreter its own `sys` 4/4 with one shared `.so` (upstream 1/4); heap lock drop releases its value and a fresh lock is empty, 4/4; `get` 1.6 ns (upstream 0.3 ns). `attach_probe.py` unchanged. **polars bug B, polars unmodified** (`polars_bugb_check.py`, N=4 × 20 rounds of `map_elements(return_dtype=pl.Int64)`): shared polars went from 3/4 interpreters getting another interpreter's `Int64` to 80/80 correct; copies 80/80 before and after |
 | found on the way | `LazyTypeObject.initializing_threads` was process-wide. A successful init `clear()`ed it, wiping another interpreter's in-flight entry. That thread lost its reentrancy guard, re-entered its own `#[pyclass]` enum-variant singleton `PyOnceLock`, and deadlocked (4 interpreters importing one shared polars at once, `PyOperator`). Hidden until M2.2 because the singleton used to be shared. Now per interpreter |
-| M2.3 audit (#7) | done. Table in "M2.3" above. New defect found and fixed: datetime C-API table on 3.12 (wrong interpreter → explanatory error). Everything else is per interpreter, or shared by CPython and immortal (measured 3.12/3.13/3.14), or `POOL` (M3) |
+| M2.3 audit (#7) | done. Table in "M2.3" above. One version-specific defect found: the datetime C-API table on 3.12 only. Out of scope, since the minimum supported Python is 3.13; the fix was reverted. Everything else is per interpreter, or shared by CPython and immortal (measured 3.12/3.13/3.14), or `POOL` (M3) |
 | unit tests | 860, parallel and serial. The three `per_interpreter` teardown tests now tear down a real own-GIL sub-interpreter (`Py_EndInterpreter`) instead of the main interpreter's registry, which other parallel tests now depend on. Assertions unchanged; mutation-checked: removing `Registry::drop`'s attach guard still fails `registry_teardown_releases_its_values`. They need 3.12+ and the full API |
 
 ### M2 acceptance
