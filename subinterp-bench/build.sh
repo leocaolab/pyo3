@@ -9,7 +9,7 @@ cd "$(dirname "$0")/probe"
 
 BASE="${BASE:-/tmp/pyo3-base}"     # 本分支的父提交,由 git worktree 准备
 FORK="${FORK:-../..}"
-[ -d "$BASE" ] || { echo "缺 $BASE —— 先 git worktree add $BASE dfdbc46"; exit 1; }
+[ -d "$BASE" ] || { echo "missing $BASE: git worktree add $BASE <upstream main commit merged into this branch>"; exit 1; }
 
 case "$(uname)" in
   Darwin) EXT=dylib; export RUSTFLAGS="-C link-arg=-undefined -C link-arg=dynamic_lookup" ;;

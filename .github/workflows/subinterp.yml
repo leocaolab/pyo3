@@ -77,7 +77,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0   # the upstream control is built from dfdbc46
+          fetch-depth: 0   # the upstream control is built from the merged upstream commit
       - uses: actions/setup-python@v5
         with:
           python-version: "3.14"
@@ -87,7 +87,8 @@ jobs:
           workspaces: subinterp-bench/probe
           key: probes
       - name: upstream control worktree
-        run: git worktree add "$RUNNER_TEMP/pyo3-base" dfdbc46
+        # the most recent upstream `main` merged into this branch (a merge's second parent)
+        run: git worktree add "$RUNNER_TEMP/pyo3-base" 1655cdfcb
       - name: build probe matrix (upstream vs fork, default/abi3, top-level/submodule)
         run: bash subinterp-bench/build.sh
         env:

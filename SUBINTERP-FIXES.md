@@ -363,7 +363,7 @@ north-star path. Where the 52 KB goes is not investigated.
 
 ## Bug ledger
 
-Every defect this branch fixed, from `git log dfdbc46..`. The last column is the test
+Every defect this branch fixed, from `git log dfdbc46..` (dfdbc46 = where the branch started; upstream `main` was merged in at 1655cdf on 2026-09-22). The last column is the test
 that fails on the code before the fix (M5.2, #15). ✔ = mutation-checked: the fix
 was put back to its pre-fix form, and the test failed. CI runs all of them
 (`.github/workflows/subinterp.yml`).

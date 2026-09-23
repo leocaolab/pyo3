@@ -3,7 +3,8 @@
 Changes in this fork relative to upstream PyO3. Upstream's own changes are in
 [`CHANGELOG.md`](CHANGELOG.md), which towncrier generates, and are not repeated here.
 
-- **Base:** upstream `main` at `dfdbc46` (2026-08-12), crate version `0.29.2`. The version
+- **Base:** branched from upstream `main` at `dfdbc46` (2026-08-12); upstream `main` merged in
+  up to `1655cdf` (2026-09-22). Crate version `0.29.2`. The version
   number is left unchanged. Releases of this fork are git tags, and consumers point
   `[patch.crates-io]` at a tag. A pre-release version such as `0.29.3-x` does not satisfy
   `pyo3 = "0.29"`: Cargo then drops the patch with only a warning and silently builds
@@ -15,6 +16,37 @@ Changes in this fork relative to upstream PyO3. Upstream's own changes are in
 
 The goal is own-GIL sub-interpreters (PEP 684): one extension used by several
 interpreters in one process, each running under its own GIL.
+
+## Unreleased
+
+### Changed
+
+- Synced with upstream `main` at `1655cdf` (91 commits). The deferred-decref pools follow
+  upstream's new pool: it holds `Py<PyAny>`, pushes before setting the dirty flag, and
+  `SuspendAttach` restores the thread state before the attach count. The main interpreter's
+  pool is upstream's `static POOL`. Per-interpreter state uses upstream's non-poisoning
+  `platform::sync::non_poison::Mutex`, as upstream's no_std rules require.
+- 10 conversion and type files are back to upstream byte for byte. Their caches are
+  `PyOnceLock` again, which is per interpreter since `subinterp-2026-09-22`.
+  `PerInterpreterCell::import`, which only they used, is removed.
+
+### Added
+
+- CI on every push (`.github/workflows/subinterp.yml`):
+  - unit tests on ubuntu and macOS, Python 3.13 and 3.14;
+  - the sub-interpreter regression tests;
+  - the abi3 build;
+  - a probe gate. It fails if the fork's result is wrong, and also if the upstream
+    control stops showing the bug.
+- A regression test for every fixed defect (`tests/test_subinterp_*.rs`; the mapping is the
+  bug ledger in `SUBINTERP-FIXES.md`). All but one were mutation-checked.
+
+### Fixed
+
+- Tests that create a sub-interpreter now run in their own processes. Creating one
+  disables `PyGILState_Check` for the rest of the process, which broke upstream's
+  `test_acquire_gil`. The breakage had been hidden by test ordering.
+- rustfmt and clippy are clean (default, abi3-py310, full); code comments are in English.
 
 ## `subinterp-2026-09-22`
 
@@ -128,4 +160,4 @@ The numbers are on macOS and Python 3.14 unless noted.
 - Creating and closing an interpreter that imports polars grows RSS by about 52 KB per
   interpreter lifetime. There is no upstream baseline, and PyO3's own share is 0.2 KB, so
   the cause is not attributed. It does not affect long-lived workers.
-- Not proposed upstream yet (#14–#16).
+- Not proposed upstream yet (#16).
