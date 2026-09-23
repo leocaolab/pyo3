@@ -16,7 +16,14 @@ Changes in this fork relative to upstream PyO3. Upstream's own changes are in
 The goal is own-GIL sub-interpreters (PEP 684): one extension used by several
 interpreters in one process, each running under its own GIL.
 
-## [Unreleased] — 2026-09-22
+## `subinterp-2026-09-22`
+
+To use it:
+
+```toml
+[patch.crates-io]
+pyo3 = { git = "https://github.com/leocaolab/pyo3", tag = "subinterp-2026-09-22" }
+```
 
 ### Added
 
