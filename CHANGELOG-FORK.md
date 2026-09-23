@@ -17,7 +17,9 @@ Changes in this fork relative to upstream PyO3. Upstream's own changes are in
 The goal is own-GIL sub-interpreters (PEP 684): one extension used by several
 interpreters in one process, each running under its own GIL.
 
-## Unreleased
+## `subinterp-2026-09-23.2`
+
+Use it with `tag = "subinterp-2026-09-23.2"` in the `[patch.crates-io]` entries (same form as below).
 
 ### Fixed
 
