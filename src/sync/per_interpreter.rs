@@ -30,6 +30,7 @@
 
 use crate::ffi;
 use crate::internal::state::AssumeAttached;
+use crate::platform::sync::non_poison::Mutex;
 use crate::Python;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -57,17 +58,13 @@ static NEXT_INDEX: AtomicUsize = AtomicUsize::new(0);
 /// Indices released by dropped cells (a `PyOnceLock` that was a field of a heap value), ready
 /// for reuse. An index is pushed here only after it has been cleared from every registry, so a
 /// new cell that reuses it can never observe an old value.
-static FREE_INDICES: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+static FREE_INDICES: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 
 /// Every live registry, so a dropped cell can clear its index from all interpreters.
 /// Lock order: `REGISTRIES`, then a registry's `lock`.
-static REGISTRIES: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+static REGISTRIES: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 
 const UNCLAIMED: usize = usize::MAX;
-
-fn lock_ignoring_poison<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|e| e.into_inner())
-}
 
 /// Bumped whenever a cached base pointer could have become wrong: a registry is dropped, or its
 /// backing storage is reallocated.
@@ -93,7 +90,7 @@ struct Registry {
     /// Serialises structural changes: growth in `set_and_get`, and clearing an index from
     /// another thread when a cell is dropped. Reads never take it: a reader holds `&cell`, and a
     /// cell cannot be dropped while it is borrowed.
-    lock: std::sync::Mutex<()>,
+    lock: Mutex<()>,
 }
 
 impl Drop for Registry {
@@ -101,7 +98,7 @@ impl Drop for Registry {
         // Unregister first, so no dropped cell on another thread reaches into this registry
         // while it is being torn down.
         let me = self as *mut Registry as usize;
-        lock_ignoring_poison(&REGISTRIES).retain(|&r| r != me);
+        REGISTRIES.lock().retain(|&r| r != me);
         // This registry's storage is about to go, and the interpreter's address may be reused.
         invalidate_caches();
         // CPython reaches this from a capsule destructor, which it calls without going through
@@ -167,7 +164,8 @@ impl<T> PerInterpreterCell<T> {
 
     #[cold]
     fn claim_index(&self) -> usize {
-        let fresh = lock_ignoring_poison(&FREE_INDICES)
+        let fresh = FREE_INDICES
+            .lock()
             .pop()
             .unwrap_or_else(|| NEXT_INDEX.fetch_add(1, Ordering::Relaxed));
         // If another thread claimed one first, use theirs and leave ours unused. A gap costs one
@@ -179,7 +177,7 @@ impl<T> PerInterpreterCell<T> {
             Ok(_) => fresh,
             Err(existing) => {
                 // Lost the race: give the index back.
-                lock_ignoring_poison(&FREE_INDICES).push(fresh);
+                FREE_INDICES.lock().push(fresh);
                 existing
             }
         }
@@ -199,20 +197,20 @@ impl<T> PerInterpreterCell<T> {
             return;
         }
         *self.index.get_mut() = UNCLAIMED;
-        // SAFETY: only reads the registry pointer if PyO3 has this thread attached.
         let current = if crate::internal::state::thread_is_attached() {
+            // SAFETY: PyO3 has this thread attached, so there is a current interpreter.
             unsafe { find_registry() as usize }
         } else {
             0
         };
         let mut own: Option<Slot> = None;
         {
-            let regs = lock_ignoring_poison(&REGISTRIES);
+            let regs = REGISTRIES.lock();
             for &r in regs.iter() {
                 // SAFETY: a registry stays in `REGISTRIES` until its `Drop` removes it, which
                 // takes the `REGISTRIES` lock held here.
                 let reg = unsafe { &mut *(r as *mut Registry) };
-                let _structural = lock_ignoring_poison(&reg.lock);
+                let _structural = reg.lock.lock();
                 if let Some(slot) = reg.slots.get_mut(idx).and_then(Option::take) {
                     if r == current {
                         own = Some(slot);
@@ -227,7 +225,7 @@ impl<T> PerInterpreterCell<T> {
             // interpreter that owns it.
             unsafe { (slot.1)(slot.0) }
         }
-        lock_ignoring_poison(&FREE_INDICES).push(idx);
+        FREE_INDICES.lock().push(idx);
     }
 
     /// Returns a reference to this interpreter's value, if it has been initialized here.
@@ -296,6 +294,9 @@ impl<T> PerInterpreterCell<T> {
     fn set_and_get(&self, py: Python<'_>, value: T) -> &T {
         let idx = self.index();
         let boxed = Box::into_raw(Box::new(value));
+        // SAFETY: `py` witnesses that this thread is attached. The registry belongs to this
+        // interpreter and is only restructured under its `lock`; `boxed` is either stored in the
+        // registry (which then owns it) or freed here, never both.
         unsafe {
             let registry = ensure_registry(py);
             if registry.is_null() {
@@ -304,7 +305,7 @@ impl<T> PerInterpreterCell<T> {
                 return &*boxed;
             }
             let registry = &mut *registry;
-            let _structural = lock_ignoring_poison(&registry.lock);
+            let _structural = registry.lock.lock();
             if registry.slots.len() <= idx {
                 registry.slots.resize(idx + 1, None);
             }
@@ -364,6 +365,7 @@ unsafe fn lookup_registry_slow(
     if registry.is_null() {
         return None;
     }
+    // SAFETY: non-null, and alive for as long as its interpreter, which this thread is attached to.
     let registry = unsafe { &*registry };
     let entry = (
         interp,
@@ -410,7 +412,7 @@ unsafe fn ensure_registry(_py: Python<'_>) -> *mut Registry {
         }
         let registry = Box::into_raw(Box::new(Registry {
             slots: Vec::new(),
-            lock: std::sync::Mutex::new(()),
+            lock: Mutex::new(()),
         }));
         let capsule = ffi::PyCapsule_New(
             registry as *mut c_void,
@@ -429,7 +431,7 @@ unsafe fn ensure_registry(_py: Python<'_>) -> *mut Registry {
             // Releasing the capsule destroyed the registry with it.
             return core::ptr::null_mut();
         }
-        lock_ignoring_poison(&REGISTRIES).push(registry as usize);
+        REGISTRIES.lock().push(registry as usize);
         register_teardown_hook(interp_dict);
         registry
     }
@@ -590,6 +592,7 @@ unsafe fn register_teardown_hook(interp_dict: *mut ffi::PyObject) {
 // SAFETY: every access goes through a `Python<'_>` token, so it is serialised by the GIL of the
 // interpreter that owns the value, and values are never handed across interpreters.
 unsafe impl<T: Send> Send for PerInterpreterCell<T> {}
+// SAFETY: as for `Send`: a shared reference only reaches values through a `Python<'_>` token.
 unsafe impl<T: Send> Sync for PerInterpreterCell<T> {}
 
 // Tests: `tests/test_subinterp_isolation.rs`. They create sub-interpreters, which disables

@@ -56,6 +56,7 @@ pub struct InterpreterHandle(*mut ffi::PyInterpreterState);
 // that interpreter's own lock, and `attach` re-checks nothing that a raw pointer could invalidate
 // — see the safety note on `attach` for the one thing the caller must guarantee.
 unsafe impl Send for InterpreterHandle {}
+// SAFETY: as for `Send`; a shared handle offers nothing beyond copying the pointer.
 unsafe impl Sync for InterpreterHandle {}
 
 impl InterpreterHandle {

@@ -40,7 +40,7 @@ use crate::{
     ffi,
     impl_::pyfunction::PyFunctionDef,
     types::{PyModule, PyModuleMethods},
-    Bound, PyClass, PyResult, PyTypeInfo,
+    Bound, PyClass, PyErr, PyResult, PyTypeInfo,
 };
 use crate::{
     sync::PyOnceLock,
@@ -132,71 +132,75 @@ impl ModuleDef {
     /// Must run before CPython reads `m_slots`, and only once.
     #[cfg(all(Py_LIMITED_API, not(Py_3_12)))]
     unsafe fn patch_multiple_interpreters_slot(&'static self) {
-        use core::sync::atomic::Ordering;
-        // The rewrite is not atomic (removing the slot shifts the rest of the array), so only
-        // one thread does it, once.
-        if self
-            .slot_patched
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return;
-        }
-        // `Py_Version` is a 3.11 data symbol that abi3-py310 cannot reference; `Py_GetVersion`
-        // has always been in the limited API and returns e.g. "3.14.6 (main, ...)", of which
-        // the first two components are enough.
-        let supported = {
-            let v = ffi::Py_GetVersion();
-            let mut major = 0i32;
-            let mut minor = 0i32;
-            let mut seen_dot = false;
-            let mut i = 0isize;
+        // SAFETY: the caller guarantees this runs once, before CPython reads `m_slots`, so
+        // nothing else is reading or writing the slot array.
+        unsafe {
+            use core::sync::atomic::Ordering;
+            // The rewrite is not atomic (removing the slot shifts the rest of the array), so only
+            // one thread does it, once.
+            if self
+                .slot_patched
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                return;
+            }
+            // `Py_Version` is a 3.11 data symbol that abi3-py310 cannot reference; `Py_GetVersion`
+            // has always been in the limited API and returns e.g. "3.14.6 (main, ...)", of which
+            // the first two components are enough.
+            let supported = {
+                let v = ffi::Py_GetVersion();
+                let mut major = 0i32;
+                let mut minor = 0i32;
+                let mut seen_dot = false;
+                let mut i = 0isize;
+                loop {
+                    let c = *v.offset(i) as u8;
+                    match c {
+                        b'0'..=b'9' => {
+                            let d = (c - b'0') as i32;
+                            if seen_dot {
+                                minor = minor * 10 + d
+                            } else {
+                                major = major * 10 + d
+                            }
+                        }
+                        b'.' if !seen_dot => seen_dot = true,
+                        _ => break,
+                    }
+                    i += 1;
+                }
+                major > 3 || (major == 3 && minor >= 12)
+            };
+            let slots = (*self.ffi_def.get()).m_slots;
+            let mut i = 0;
             loop {
-                let c = *v.offset(i) as u8;
-                match c {
-                    b'0'..=b'9' => {
-                        let d = (c - b'0') as i32;
-                        if seen_dot {
-                            minor = minor * 10 + d
-                        } else {
-                            major = major * 10 + d
+                let slot = &mut *slots.add(i);
+                if slot.slot == 0 {
+                    return; // no placeholder: this build did not reserve one
+                }
+                if slot.slot == PLACEHOLDER_MULTIPLE_INTERPRETERS {
+                    if supported {
+                        slot.slot = ffi::Py_mod_multiple_interpreters;
+                        // The constant is gated on Py_3_12 in pyo3-ffi, so abi3-py310 cannot name
+                        // it; its value is fixed at 2 (CPython's moduleobject.h).
+                        slot.value = 2 as *mut core::ffi::c_void;
+                    } else {
+                        // before 3.12: remove the placeholder by shifting the rest down one entry
+                        let mut j = i;
+                        loop {
+                            let next = *slots.add(j + 1);
+                            *slots.add(j) = next;
+                            if next.slot == 0 {
+                                break;
+                            }
+                            j += 1;
                         }
                     }
-                    b'.' if !seen_dot => seen_dot = true,
-                    _ => break,
+                    return;
                 }
                 i += 1;
             }
-            major > 3 || (major == 3 && minor >= 12)
-        };
-        let slots = (*self.ffi_def.get()).m_slots;
-        let mut i = 0;
-        loop {
-            let slot = &mut *slots.add(i);
-            if slot.slot == 0 {
-                return; // no placeholder: this build did not reserve one
-            }
-            if slot.slot == PLACEHOLDER_MULTIPLE_INTERPRETERS {
-                if supported {
-                    slot.slot = ffi::Py_mod_multiple_interpreters;
-                    // The constant is gated on Py_3_12 in pyo3-ffi, so abi3-py310 cannot name
-                    // it; its value is fixed at 2 (CPython's moduleobject.h).
-                    slot.value = 2 as *mut core::ffi::c_void;
-                } else {
-                    // before 3.12: remove the placeholder by shifting the rest down one entry
-                    let mut j = i;
-                    loop {
-                        let next = *slots.add(j + 1);
-                        *slots.add(j) = next;
-                        if next.slot == 0 {
-                            break;
-                        }
-                        j += 1;
-                    }
-                }
-                return;
-            }
-            i += 1;
         }
     }
 
@@ -589,6 +593,30 @@ unsafe impl Sync for PyModuleSlots {}
 // which only uses them to build the `ffi::ModuleDef`.
 #[cfg(not(all(Py_LIMITED_API, Py_GIL_DISABLED)))]
 unsafe impl Sync for PyModuleDefSlots {}
+
+/// Used to accept either `()` or `Result<(), E>` from a `#[pymodule_init]` function.
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` is not a suitable return value for `#[pymodule_init]` functions",
+    note = "`#[pymodule_init]` functions may return `()` or `Result<(), E>` where `PyErr: From<E>`"
+)]
+pub trait PyModuleInitResult {
+    fn into_result(self) -> PyResult<()>;
+}
+
+impl PyModuleInitResult for () {
+    fn into_result(self) -> PyResult<()> {
+        Ok(())
+    }
+}
+
+impl<E> PyModuleInitResult for Result<(), E>
+where
+    PyErr: From<E>,
+{
+    fn into_result(self) -> PyResult<()> {
+        self.map_err(PyErr::from)
+    }
+}
 
 /// Trait to add an element (class, function...) to a module.
 ///

@@ -47,6 +47,10 @@ pub fn in_sub_interpreters<R: Send>(n: usize, f: impl Fn(usize, Python<'_>) -> R
 }
 
 /// `in_sub_interpreters` with one interpreter.
+#[expect(
+    clippy::disallowed_types,
+    reason = "a std Mutex hands the FnOnce to the thread; tests are std"
+)]
 pub fn in_sub_interpreter<R: Send>(f: impl FnOnce(Python<'_>) -> R + Send) -> R {
     let f = std::sync::Mutex::new(Some(f));
     in_sub_interpreters(1, |_, py| (f.lock().unwrap().take().unwrap())(py))

@@ -1,6 +1,3 @@
-// TODO https://github.com/PyO3/pyo3/issues/5487
-#![allow(clippy::undocumented_unsafe_blocks)]
-
 //! Synchronization mechanisms which are aware of the existence of the Python interpreter.
 //!
 //! The Python interpreter has multiple "stop the world" situations which may block threads, such as
@@ -12,6 +9,7 @@
 //! interpreter.
 //!
 //! This module provides synchronization primitives which are able to synchronize under these conditions.
+use crate::platform::sync::Once;
 use crate::{
     internal::state::SuspendAttach,
     sealed::Sealed,
@@ -19,7 +17,6 @@ use crate::{
     Bound, Py, Python,
 };
 use core::{cell::UnsafeCell, marker::PhantomData, mem::MaybeUninit};
-use std::sync::{Once, OnceState};
 
 mod interpreter_handle;
 mod per_interpreter;
@@ -27,7 +24,12 @@ pub use interpreter_handle::InterpreterHandle;
 pub use per_interpreter::PerInterpreterCell;
 
 pub mod critical_section;
+#[cfg(all(not(Py_LIMITED_API), Py_3_13))]
+mod mutex;
 pub(crate) mod once_lock;
+
+#[cfg(all(not(Py_LIMITED_API), Py_3_13))]
+pub use self::mutex::{PyMutex, PyMutexGuard};
 
 /// Deprecated alias for [`pyo3::sync::critical_section::with_critical_section`][crate::sync::critical_section::with_critical_section]
 #[deprecated(
@@ -58,6 +60,9 @@ pub use self::once_lock::PyOnceLock;
     since = "0.26.0",
     note = "Now internal only, to be removed after https://github.com/PyO3/pyo3/pull/5341"
 )]
+// Its only user was `LazyTypeObject`, which now stores its values per interpreter. Kept, with
+// its tests, until upstream removes it.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct GILOnceCell<T> {
     once: Once,
     data: UnsafeCell<MaybeUninit<T>>,
@@ -104,6 +109,7 @@ unsafe impl<T: Send + Sync> Sync for GILOnceCell<T> {}
 unsafe impl<T: Send> Send for GILOnceCell<T> {}
 
 #[allow(deprecated)]
+#[cfg_attr(not(test), allow(dead_code))]
 impl<T> GILOnceCell<T> {
     /// Create a `GILOnceCell` which does not yet contain a value.
     pub const fn new() -> Self {
@@ -168,7 +174,7 @@ impl<T> GILOnceCell<T> {
         // NB this can block, but since this is only writing a single value and
         // does not call arbitrary python code, we don't need to worry about
         // deadlocks with the GIL.
-        self.once.call_once_force(|_| {
+        self.once.call_once_force(|| {
             // SAFETY: no other threads can be writing this value, because we are
             // inside the `call_once_force` closure.
             unsafe {
@@ -350,8 +356,10 @@ pub trait RwLockExt<T>: rwlock_ext_sealed::Sealed {
     fn write_py_attached(&self, py: Python<'_>) -> Self::WriteLockResult<'_>;
 }
 
-impl OnceExt for Once {
-    type OnceState = OnceState;
+#[cfg(wip_feature_std)]
+#[allow(clippy::disallowed_types)]
+impl OnceExt for std::sync::Once {
+    type OnceState = std::sync::OnceState;
 
     fn call_once_py_attached(&self, py: Python<'_>, f: impl FnOnce()) {
         if self.is_completed() {
@@ -361,7 +369,7 @@ impl OnceExt for Once {
         init_once_py_attached(self, py, f)
     }
 
-    fn call_once_force_py_attached(&self, py: Python<'_>, f: impl FnOnce(&OnceState)) {
+    fn call_once_force_py_attached(&self, py: Python<'_>, f: impl FnOnce(&std::sync::OnceState)) {
         if self.is_completed() {
             return;
         }
@@ -379,6 +387,9 @@ impl OnceExt for parking_lot::Once {
             return;
         }
 
+        // SAFETY: detach from the runtime right before a possibly blocking call
+        // then reattach when the blocking call completes and before calling
+        // into the C API.
         let ts_guard = unsafe { SuspendAttach::new() };
 
         self.call_once(move || {
@@ -396,6 +407,9 @@ impl OnceExt for parking_lot::Once {
             return;
         }
 
+        // SAFETY: detach from the runtime right before a possibly blocking call
+        // then reattach when the blocking call completes and before calling
+        // into the C API.
         let ts_guard = unsafe { SuspendAttach::new() };
 
         self.call_once_force(move |state| {
@@ -405,7 +419,6 @@ impl OnceExt for parking_lot::Once {
     }
 }
 
-#[cfg(wip_feature_std)]
 impl<T> OnceLockExt<T> for std::sync::OnceLock<T> {
     fn get_or_init_py_attached<F>(&self, py: Python<'_>, f: F) -> &T
     where
@@ -418,6 +431,7 @@ impl<T> OnceLockExt<T> for std::sync::OnceLock<T> {
 }
 
 #[cfg(wip_feature_std)]
+#[allow(clippy::disallowed_types)]
 impl<T> MutexExt<T> for std::sync::Mutex<T> {
     type LockResult<'a>
         = std::sync::LockResult<std::sync::MutexGuard<'a, T>>
@@ -461,6 +475,9 @@ impl<R: lock_api::RawMutex, T> MutexExt<T> for lock_api::Mutex<R, T> {
             return guard;
         }
 
+        // SAFETY: detach from the runtime right before a possibly blocking call
+        // then reattach when the blocking call completes and before calling
+        // into the C API.
         let ts_guard = unsafe { SuspendAttach::new() };
         let res = self.lock();
         drop(ts_guard);
@@ -483,6 +500,9 @@ where
             return guard;
         }
 
+        // SAFETY: detach from the runtime right before a possibly blocking call
+        // then reattach when the blocking call completes and before calling
+        // into the C API.
         let ts_guard = unsafe { SuspendAttach::new() };
         let res = self.lock_arc();
         drop(ts_guard);
@@ -506,6 +526,9 @@ where
             return guard;
         }
 
+        // SAFETY: detach from the runtime right before a possibly blocking call
+        // then reattach when the blocking call completes and before calling
+        // into the C API.
         let ts_guard = unsafe { SuspendAttach::new() };
         let res = self.lock();
         drop(ts_guard);
@@ -529,6 +552,9 @@ where
             return guard;
         }
 
+        // SAFETY: detach from the runtime right before a possibly blocking call
+        // then reattach when the blocking call completes and before calling
+        // into the C API.
         let ts_guard = unsafe { SuspendAttach::new() };
         let res = self.lock_arc();
         drop(ts_guard);
@@ -536,7 +562,6 @@ where
     }
 }
 
-#[cfg(wip_feature_std)]
 impl<T> RwLockExt<T> for std::sync::RwLock<T> {
     type ReadLockResult<'a>
         = std::sync::LockResult<std::sync::RwLockReadGuard<'a, T>>
@@ -612,6 +637,9 @@ impl<R: lock_api::RawRwLock, T> RwLockExt<T> for lock_api::RwLock<R, T> {
             return guard;
         }
 
+        // SAFETY: detach from the runtime right before a possibly blocking call
+        // then reattach when the blocking call completes and before calling
+        // into the C API.
         let ts_guard = unsafe { SuspendAttach::new() };
         let res = self.read();
         drop(ts_guard);
@@ -623,6 +651,9 @@ impl<R: lock_api::RawRwLock, T> RwLockExt<T> for lock_api::RwLock<R, T> {
             return guard;
         }
 
+        // SAFETY: detach from the runtime right before a possibly blocking call
+        // then reattach when the blocking call completes and before calling
+        // into the C API.
         let ts_guard = unsafe { SuspendAttach::new() };
         let res = self.write();
         drop(ts_guard);
@@ -650,6 +681,9 @@ where
             return guard;
         }
 
+        // SAFETY: detach from the runtime right before a possibly blocking call
+        // then reattach when the blocking call completes and before calling
+        // into the C API.
         let ts_guard = unsafe { SuspendAttach::new() };
         let res = self.read_arc();
         drop(ts_guard);
@@ -661,6 +695,9 @@ where
             return guard;
         }
 
+        // SAFETY: detach from the runtime right before a possibly blocking call
+        // then reattach when the blocking call completes and before calling
+        // into the C API.
         let ts_guard = unsafe { SuspendAttach::new() };
         let res = self.write_arc();
         drop(ts_guard);
@@ -668,8 +705,10 @@ where
     }
 }
 
+#[cfg(wip_feature_std)]
 #[cold]
-fn init_once_py_attached<F, T>(once: &Once, _py: Python<'_>, f: F)
+#[allow(clippy::disallowed_types)]
+fn init_once_py_attached<F, T>(once: &std::sync::Once, _py: Python<'_>, f: F)
 where
     F: FnOnce() -> T,
 {
@@ -684,10 +723,12 @@ where
     });
 }
 
+#[cfg(wip_feature_std)]
 #[cold]
-fn init_once_force_py_attached<F, T>(once: &Once, _py: Python<'_>, f: F)
+#[allow(clippy::disallowed_types)]
+fn init_once_force_py_attached<F, T>(once: &std::sync::Once, _py: Python<'_>, f: F)
 where
-    F: FnOnce(&OnceState) -> T,
+    F: FnOnce(&std::sync::OnceState) -> T,
 {
     // SAFETY: detach from the runtime right before a possibly blocking call
     // then reattach when the blocking call completes and before calling
@@ -700,7 +741,6 @@ where
     });
 }
 
-#[cfg(wip_feature_std)]
 #[cold]
 fn init_once_lock_py_attached<'a, F, T>(
     lock: &'a std::sync::OnceLock<T>,
@@ -727,13 +767,11 @@ where
 
 mod once_lock_ext_sealed {
     pub trait Sealed {}
-    #[cfg(wip_feature_std)]
     impl<T> Sealed for std::sync::OnceLock<T> {}
 }
 
 mod rwlock_ext_sealed {
     pub trait Sealed {}
-    #[cfg(wip_feature_std)]
     impl<T> Sealed for std::sync::RwLock<T> {}
     #[cfg(feature = "lock_api")]
     impl<R, T> Sealed for lock_api::RwLock<R, T> {}
@@ -741,6 +779,7 @@ mod rwlock_ext_sealed {
     impl<R, T> Sealed for alloc::sync::Arc<lock_api::RwLock<R, T>> {}
 }
 
+#[allow(clippy::disallowed_types, reason = "tests")]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -752,8 +791,12 @@ mod tests {
     #[cfg(not(target_arch = "wasm32"))]
     #[cfg(feature = "macros")]
     use std::sync::Barrier;
+    #[cfg(wip_feature_std)]
     #[cfg(not(target_arch = "wasm32"))]
     use std::sync::Mutex;
+    #[cfg(wip_feature_std)]
+    #[cfg(not(target_arch = "wasm32"))]
+    use std::sync::{Once, OnceState};
 
     #[cfg(not(target_arch = "wasm32"))]
     #[cfg(feature = "macros")]
@@ -825,6 +868,7 @@ mod tests {
 
     #[test]
     #[cfg(not(target_arch = "wasm32"))] // We are building wasm Python with pthreads disabled
+    #[cfg(wip_feature_std)]
     fn test_once_ext() {
         macro_rules! test_once {
             ($once:expr, $is_poisoned:expr) => {{
@@ -870,6 +914,7 @@ mod tests {
     }
 
     #[cfg(not(target_arch = "wasm32"))] // We are building wasm Python with pthreads disabled
+    #[cfg(wip_feature_std)]
     #[test]
     fn test_once_lock_ext() {
         let cell = std::sync::OnceLock::new();
@@ -887,6 +932,7 @@ mod tests {
 
     #[cfg(feature = "macros")]
     #[cfg(not(target_arch = "wasm32"))] // We are building wasm Python with pthreads disabled
+    #[cfg(wip_feature_std)]
     #[test]
     fn test_mutex_ext() {
         let barrier = Barrier::new(2);
@@ -979,6 +1025,7 @@ mod tests {
     }
 
     #[cfg(not(target_arch = "wasm32"))] // We are building wasm Python with pthreads disabled
+    #[cfg(wip_feature_std)]
     #[test]
     fn test_mutex_ext_poison() {
         let mutex = Mutex::new(42);

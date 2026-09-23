@@ -1,3 +1,5 @@
+//! Python sets and related types.
+
 use crate::types::PyIterator;
 use crate::{
     err::{self, PyErr, PyResult},
@@ -294,7 +296,7 @@ impl ExactSizeIterator for BoundSetIterator<'_> {
 #[cfg(test)]
 mod tests {
     use super::PySet;
-    use crate::platform::HashSet;
+    use crate::platform::collections::HashSet;
     use crate::{
         conversion::IntoPyObject,
         types::{PyAnyMethods, PySetMethods},

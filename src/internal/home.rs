@@ -21,7 +21,7 @@
 //! after `py.detach` on the same thread was measured correct everywhere.
 
 use crate::ffi;
-use std::sync::Mutex;
+use crate::platform::sync::non_poison::Mutex;
 
 /// Where a foreign-thread attach should go.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,9 +86,9 @@ fn target(home: *mut ffi::PyInterpreterState, flags: u8) -> ForeignTarget {
 }
 
 fn lock() -> std::sync::MutexGuard<'static, (usize, u8)> {
-    // A panic while holding this lock cannot leave the pair half-written (both
-    // fields are assigned together), so a poisoned lock is still consistent.
-    STATE.lock().unwrap_or_else(|e| e.into_inner())
+    // Not poisoning: a panic while holding this lock cannot leave the pair half-written (both
+    // fields are assigned together).
+    STATE.lock()
 }
 
 /// Records that the current interpreter executed a module of this copy.

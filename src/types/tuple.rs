@@ -1,3 +1,5 @@
+//! Python tuples and related types.
+
 use crate::ffi::{self, Py_ssize_t};
 use crate::ffi_ptr_ext::FfiPtrExt;
 #[cfg(feature = "experimental-inspect")]
@@ -1063,8 +1065,8 @@ tuple_conversion!(
 
 #[cfg(test)]
 mod tests {
+    use crate::platform::collections::HashSet;
     use crate::platform::prelude::*;
-    use crate::platform::HashSet;
     use crate::types::{any::PyAnyMethods, tuple::PyTupleMethods, PyList, PyTuple};
     use crate::{Bound, IntoPyObject, PyAny, Python};
     #[cfg(feature = "nightly")]
