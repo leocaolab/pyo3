@@ -7,10 +7,10 @@ name: subinterp
 
 on:
   push:
-    branches: [subinterp-per-interpreter-state]
+    branches: [main, subinterp-per-interpreter-state]
     tags: ["subinterp-*"]
   pull_request:
-    branches: [subinterp-per-interpreter-state]
+    branches: [main, subinterp-per-interpreter-state]
   workflow_dispatch:
 
 concurrency:
