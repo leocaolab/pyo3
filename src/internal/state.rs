@@ -8,13 +8,15 @@ use crate::impl_::panic::PanicTrap;
 use crate::platform::prelude::*;
 use crate::{ffi, Python};
 
+#[cfg(not(pyo3_disable_reference_pool))]
+use alloc::sync::Arc;
 use core::cell::Cell;
 #[cfg(not(pyo3_disable_reference_pool))]
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 #[cfg_attr(pyo3_disable_reference_pool, allow(unused_imports))]
 use core::{mem, ptr::NonNull};
 #[cfg(not(pyo3_disable_reference_pool))]
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 std::thread_local! {
     /// This is an internal counter in pyo3 monitoring whether this thread is attached to the interpreter.
@@ -217,9 +219,10 @@ impl AttachGuard {
     /// Acquires the `AttachGuard` while assuming that the thread is already attached
     /// to the interpreter.
     pub(crate) unsafe fn assume() -> Self {
-        // 只取一次 TLS 地址,进出共用。在 dylib 里每次 thread_local 访问都要走
-        // 一次 tlv_get_addr(macOS)/__tls_get_addr —— 进 +1、出 -1 各取一次,
-        // 实测占了整个 FFI 边界税(2.24ns / 每次调用)的大头。
+        // Look up the TLS address once and use it for both the increment here and the decrement
+        // in `Drop`. In a dylib every `thread_local` access goes through `tlv_get_addr` (macOS) /
+        // `__tls_get_addr`; doing it twice was most of the measured FFI boundary cost (2.24 ns per
+        // call).
         let cell = attach_count_cell();
         if !cell.is_null() {
             // SAFETY: non-null means this thread's TLS is alive; the guard cannot outlive
@@ -441,7 +444,9 @@ fn owner_now() -> Option<PoolKey> {
     #[cfg(any(not(Py_LIMITED_API), Py_3_10))]
     if !tstate.is_null() {
         // SAFETY: `tstate` is non-null.
-        return Some(pool_key(unsafe { ffi::PyThreadState_GetInterpreter(tstate) }));
+        return Some(pool_key(unsafe {
+            ffi::PyThreadState_GetInterpreter(tstate)
+        }));
     }
     #[cfg(all(Py_LIMITED_API, not(Py_3_10)))]
     let _ = tstate;
@@ -467,7 +472,7 @@ fn pool_for(key: PoolKey) -> Arc<ReferencePool> {
 
 /// The pool of the thread that is dropping an object right now. Used by the unit tests, which
 /// call it on an attached main-interpreter thread.
-#[cfg(not(pyo3_disable_reference_pool))]
+#[cfg(all(test, not(pyo3_disable_reference_pool)))]
 fn get_pool() -> Arc<ReferencePool> {
     pool_for(owner_now().expect("no owning interpreter for this thread"))
 }
@@ -540,10 +545,10 @@ fn drop_deferred_references_slow(py: Python<'_>) {
 
 /// Called from the per-interpreter teardown hook, attached to the interpreter being destroyed:
 /// removes its pool and applies the decrefs still queued in it.
-pub(crate) fn drain_pool_on_teardown(py: Python<'_>) {
+pub(crate) fn drain_pool_on_teardown(_py: Python<'_>) {
     #[cfg(not(pyo3_disable_reference_pool))]
     {
-        // SAFETY: attached (`py`).
+        // SAFETY: attached (`_py`).
         let key = pool_key(unsafe { ffi::PyInterpreterState_Get() });
         // Loop: a decref can run a destructor that drops another `Py<T>` of this interpreter.
         loop {
@@ -565,8 +570,6 @@ pub(crate) fn drain_pool_on_teardown(py: Python<'_>) {
             }
         }
     }
-    #[cfg(pyo3_disable_reference_pool)]
-    let _ = py;
 }
 
 /// A guard which can be used to temporarily detach from the interpreter and restore on `Drop`.

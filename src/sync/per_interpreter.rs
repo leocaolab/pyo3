@@ -327,7 +327,10 @@ impl<T> PerInterpreterCell<T> {
 /// # Safety
 /// `ptr` must have come from `Box::into_raw` on a `Box<T>`.
 unsafe fn drop_boxed<T>(ptr: *mut c_void) {
-    drop(Box::from_raw(ptr as *mut T));
+    // SAFETY: the caller guarantees `ptr` came from `Box::into_raw` on a `Box<T>`.
+    unsafe {
+        drop(Box::from_raw(ptr as *mut T));
+    }
 }
 
 /// Returns `(base, len)` of the current interpreter's registry, or `None` if it has none yet.
@@ -337,13 +340,16 @@ unsafe fn drop_boxed<T>(ptr: *mut c_void) {
 /// atomic load. [`GENERATION`] is what makes the pointer safe to compare.
 #[inline]
 unsafe fn current_registry(py: Python<'_>) -> Option<(*const Option<Slot>, usize)> {
-    let interp = ffi::PyInterpreterState_Get();
-    let generation = GENERATION.load(Ordering::Acquire);
-    let (cached_interp, cached_generation, base, len) = CACHE.with(Cell::get);
-    if cached_interp == interp && cached_generation == generation {
-        return Some((base, len));
+    // SAFETY: `py` witnesses that this thread is attached, so there is a current interpreter.
+    unsafe {
+        let interp = ffi::PyInterpreterState_Get();
+        let generation = GENERATION.load(Ordering::Acquire);
+        let (cached_interp, cached_generation, base, len) = CACHE.with(Cell::get);
+        if cached_interp == interp && cached_generation == generation {
+            return Some((base, len));
+        }
+        lookup_registry_slow(py, interp, generation)
     }
-    lookup_registry_slow(py, interp, generation)
 }
 
 #[cold]
@@ -352,80 +358,96 @@ unsafe fn lookup_registry_slow(
     interp: *mut ffi::PyInterpreterState,
     generation: u64,
 ) -> Option<(*const Option<Slot>, usize)> {
-    let registry = find_registry();
+    // SAFETY: the caller is attached (it passed `_py`), and a non-null registry is alive for as
+    // long as its interpreter, which this thread is attached to.
+    let registry = unsafe { find_registry() };
     if registry.is_null() {
         return None;
     }
-    let registry = &*registry;
-    let entry = (interp, generation, registry.slots.as_ptr(), registry.slots.len());
+    let registry = unsafe { &*registry };
+    let entry = (
+        interp,
+        generation,
+        registry.slots.as_ptr(),
+        registry.slots.len(),
+    );
     CACHE.with(|c| c.set(entry));
     Some((entry.2, entry.3))
 }
 
 /// Returns this interpreter's registry, or null if it has none.
 unsafe fn find_registry() -> *mut Registry {
-    let interp_dict = ffi::PyInterpreterState_GetDict(ffi::PyInterpreterState_Get());
-    if interp_dict.is_null() {
-        return core::ptr::null_mut();
+    // SAFETY: the caller is attached to an interpreter (every caller holds a `Python` token or runs inside a CPython callback of that interpreter).
+    unsafe {
+        let interp_dict = ffi::PyInterpreterState_GetDict(ffi::PyInterpreterState_Get());
+        if interp_dict.is_null() {
+            return core::ptr::null_mut();
+        }
+        let capsule = ffi::PyDict_GetItemString(interp_dict, REGISTRY_KEY.as_ptr());
+        if capsule.is_null() {
+            return core::ptr::null_mut();
+        }
+        let raw = ffi::PyCapsule_GetPointer(capsule, CAPSULE_NAME.as_ptr());
+        if raw.is_null() {
+            ffi::PyErr_Clear();
+            return core::ptr::null_mut();
+        }
+        raw as *mut Registry
     }
-    let capsule = ffi::PyDict_GetItemString(interp_dict, REGISTRY_KEY.as_ptr());
-    if capsule.is_null() {
-        return core::ptr::null_mut();
-    }
-    let raw = ffi::PyCapsule_GetPointer(capsule, CAPSULE_NAME.as_ptr());
-    if raw.is_null() {
-        ffi::PyErr_Clear();
-        return core::ptr::null_mut();
-    }
-    raw as *mut Registry
 }
 
 /// Returns this interpreter's registry, creating it if absent.
 unsafe fn ensure_registry(_py: Python<'_>) -> *mut Registry {
-    let existing = find_registry();
-    if !existing.is_null() {
-        return existing;
+    // SAFETY: `_py` witnesses that this thread is attached; the capsule takes ownership of the box, and the box is only freed here if the capsule was never created.
+    unsafe {
+        let existing = find_registry();
+        if !existing.is_null() {
+            return existing;
+        }
+        let interp_dict = ffi::PyInterpreterState_GetDict(ffi::PyInterpreterState_Get());
+        if interp_dict.is_null() {
+            return core::ptr::null_mut();
+        }
+        let registry = Box::into_raw(Box::new(Registry {
+            slots: Vec::new(),
+            lock: std::sync::Mutex::new(()),
+        }));
+        let capsule = ffi::PyCapsule_New(
+            registry as *mut c_void,
+            CAPSULE_NAME.as_ptr(),
+            Some(registry_destructor),
+        );
+        if capsule.is_null() {
+            ffi::PyErr_Clear();
+            drop(Box::from_raw(registry));
+            return core::ptr::null_mut();
+        }
+        let rc = ffi::PyDict_SetItemString(interp_dict, REGISTRY_KEY.as_ptr(), capsule);
+        ffi::Py_DECREF(capsule); // the dict holds the surviving reference
+        if rc < 0 {
+            ffi::PyErr_Clear();
+            // Releasing the capsule destroyed the registry with it.
+            return core::ptr::null_mut();
+        }
+        lock_ignoring_poison(&REGISTRIES).push(registry as usize);
+        register_teardown_hook(interp_dict);
+        registry
     }
-    let interp_dict = ffi::PyInterpreterState_GetDict(ffi::PyInterpreterState_Get());
-    if interp_dict.is_null() {
-        return core::ptr::null_mut();
-    }
-    let registry = Box::into_raw(Box::new(Registry {
-        slots: Vec::new(),
-        lock: std::sync::Mutex::new(()),
-    }));
-    let capsule = ffi::PyCapsule_New(
-        registry as *mut c_void,
-        CAPSULE_NAME.as_ptr(),
-        Some(registry_destructor),
-    );
-    if capsule.is_null() {
-        ffi::PyErr_Clear();
-        drop(Box::from_raw(registry));
-        return core::ptr::null_mut();
-    }
-    let rc = ffi::PyDict_SetItemString(interp_dict, REGISTRY_KEY.as_ptr(), capsule);
-    ffi::Py_DECREF(capsule); // the dict holds the surviving reference
-    if rc < 0 {
-        ffi::PyErr_Clear();
-        // Releasing the capsule destroyed the registry with it.
-        return core::ptr::null_mut();
-    }
-    lock_ignoring_poison(&REGISTRIES).push(registry as usize);
-    register_teardown_hook(interp_dict);
-    registry
 }
 
 /// Drops an interpreter's registry when CPython destroys its capsule.
 unsafe extern "C" fn registry_destructor(capsule: *mut ffi::PyObject) {
-    let raw = ffi::PyCapsule_GetPointer(capsule, CAPSULE_NAME.as_ptr()) as *mut Registry;
-    if raw.is_null() {
-        ffi::PyErr_Clear();
-        return;
+    // SAFETY: CPython calls this with the capsule's interpreter current; the pointer came from `Box::into_raw` in `ensure_registry`.
+    unsafe {
+        let raw = ffi::PyCapsule_GetPointer(capsule, CAPSULE_NAME.as_ptr()) as *mut Registry;
+        if raw.is_null() {
+            ffi::PyErr_Clear();
+            return;
+        }
+        // A thread still caching this registry's base holds a stale interpreter id, and the id is
+        // checked before the pointer is used.
+        drop(Box::from_raw(raw));
     }
-    // A thread still caching this registry's base holds a stale interpreter id, and the id is
-    // checked before the pointer is used.
-    drop(Box::from_raw(raw));
 }
 
 // ---------------------------------------------------------------------------
@@ -446,45 +468,48 @@ unsafe extern "C" fn teardown(
     _self: *mut ffi::PyObject,
     _args: *mut ffi::PyObject,
 ) -> *mut ffi::PyObject {
-    // This interpreter is going away: stop sending foreign-thread attaches to it.
-    crate::internal::home::on_interpreter_teardown(ffi::PyInterpreterState_Get());
-    // Apply the decrefs still queued for it, while its objects exist (M3.2). CPython calls this
-    // hook directly, so PyO3's attach count is zero: without the guard a destructor run here
-    // would queue its own drops into the pool being removed.
-    {
-        let _attached = AssumeAttached::new();
-        crate::internal::state::drain_pool_on_teardown(Python::assume_attached());
-    }
-    let interp_dict = ffi::PyInterpreterState_GetDict(ffi::PyInterpreterState_Get());
-    if !interp_dict.is_null() {
-        if ffi::PyDict_DelItemString(interp_dict, REGISTRY_KEY.as_ptr()) < 0 {
-            ffi::PyErr_Clear();
+    // SAFETY: CPython calls this `atexit` hook from `Py_EndInterpreter` with this interpreter's thread state current and its GIL held.
+    unsafe {
+        // This interpreter is going away: stop sending foreign-thread attaches to it.
+        crate::internal::home::on_interpreter_teardown(ffi::PyInterpreterState_Get());
+        // Apply the decrefs still queued for it, while its objects exist (M3.2). CPython calls this
+        // hook directly, so PyO3's attach count is zero: without the guard a destructor run here
+        // would queue its own drops into the pool being removed.
+        {
+            let _attached = AssumeAttached::new();
+            crate::internal::state::drain_pool_on_teardown(Python::assume_attached());
         }
-        // Three passes, not one: collecting a type object makes what it referenced unreachable in
-        // turn, and that is only seen on the next pass. One pass recovered 25% of the excess,
-        // three recover all of it.
-        //
-        // `gc.collect` was stored when the hook was registered: no import here, mid-teardown.
-        let collect = ffi::PyDict_GetItemString(interp_dict, GC_COLLECT_KEY.as_ptr());
-        if !collect.is_null() {
-            ffi::Py_INCREF(collect);
-            for _ in 0..3 {
-                let r = ffi::PyObject_CallObject(collect, core::ptr::null_mut());
-                if r.is_null() {
-                    ffi::PyErr_Clear();
-                    break;
-                }
-                ffi::Py_DECREF(r);
+        let interp_dict = ffi::PyInterpreterState_GetDict(ffi::PyInterpreterState_Get());
+        if !interp_dict.is_null() {
+            if ffi::PyDict_DelItemString(interp_dict, REGISTRY_KEY.as_ptr()) < 0 {
+                ffi::PyErr_Clear();
             }
-            ffi::Py_DECREF(collect);
+            // Three passes, not one: collecting a type object makes what it referenced unreachable in
+            // turn, and that is only seen on the next pass. One pass recovered 25% of the excess,
+            // three recover all of it.
+            //
+            // `gc.collect` was stored when the hook was registered: no import here, mid-teardown.
+            let collect = ffi::PyDict_GetItemString(interp_dict, GC_COLLECT_KEY.as_ptr());
+            if !collect.is_null() {
+                ffi::Py_INCREF(collect);
+                for _ in 0..3 {
+                    let r = ffi::PyObject_CallObject(collect, core::ptr::null_mut());
+                    if r.is_null() {
+                        ffi::PyErr_Clear();
+                        break;
+                    }
+                    ffi::Py_DECREF(r);
+                }
+                ffi::Py_DECREF(collect);
+            }
         }
+        ffi::Py_INCREF(ffi::Py_None());
+        ffi::Py_None()
     }
-    ffi::Py_INCREF(ffi::Py_None());
-    ffi::Py_None()
 }
 
-/// `PyMethodDef` is only read by CPython, so a shared static is sound.
 struct TeardownDef(ffi::PyMethodDef);
+// SAFETY: `PyMethodDef` is only read by CPython, so a shared static is sound.
 unsafe impl Sync for TeardownDef {}
 
 static TEARDOWN_DEF: TeardownDef = TeardownDef(ffi::PyMethodDef {
@@ -501,86 +526,64 @@ static TEARDOWN_DEF: TeardownDef = TeardownDef(ffi::PyMethodDef {
 /// Failure is not fatal: without the hook the registry is reclaimed later, or not at all, which is
 /// the behaviour this exists to improve on.
 unsafe fn register_teardown_hook(interp_dict: *mut ffi::PyObject) {
-    if !ffi::PyDict_GetItemString(interp_dict, HOOK_KEY.as_ptr()).is_null() {
-        return;
-    }
-    let atexit = ffi::PyImport_ImportModule(c"atexit".as_ptr());
-    if atexit.is_null() {
-        ffi::PyErr_Clear();
-        return;
-    }
-    let callable = ffi::PyCFunction_NewEx(
-        &TEARDOWN_DEF.0 as *const ffi::PyMethodDef as *mut ffi::PyMethodDef,
-        core::ptr::null_mut(),
-        core::ptr::null_mut(),
-    );
-    if callable.is_null() {
-        ffi::PyErr_Clear();
-        ffi::Py_DECREF(atexit);
-        return;
-    }
-    let name = ffi::PyUnicode_FromString(c"register".as_ptr());
-    // 同上:`PyObject_CallMethodOneArg` 不在限定 API 里。
-    let res = ffi::PyObject_CallMethodObjArgs(
-        atexit,
-        name,
-        callable,
-        core::ptr::null_mut::<ffi::PyObject>(),
-    );
-    if res.is_null() {
-        ffi::PyErr_Clear();
-    } else {
-        ffi::Py_DECREF(res);
-    }
-    if !name.is_null() {
-        ffi::Py_DECREF(name);
-    }
-    if ffi::PyDict_SetItemString(interp_dict, HOOK_KEY.as_ptr(), callable) < 0 {
-        ffi::PyErr_Clear();
-    }
-    // Resolve `gc.collect` now, while the interpreter is healthy; the hook only calls it.
-    let gc = ffi::PyImport_ImportModule(c"gc".as_ptr());
-    if gc.is_null() {
-        ffi::PyErr_Clear();
-    } else {
-        let collect = ffi::PyObject_GetAttrString(gc, c"collect".as_ptr());
-        if collect.is_null() {
+    // SAFETY: the caller is attached and `interp_dict` is the current interpreter's dict.
+    unsafe {
+        if !ffi::PyDict_GetItemString(interp_dict, HOOK_KEY.as_ptr()).is_null() {
+            return;
+        }
+        let atexit = ffi::PyImport_ImportModule(c"atexit".as_ptr());
+        if atexit.is_null() {
+            ffi::PyErr_Clear();
+            return;
+        }
+        let callable = ffi::PyCFunction_NewEx(
+            &TEARDOWN_DEF.0 as *const ffi::PyMethodDef as *mut ffi::PyMethodDef,
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+        );
+        if callable.is_null() {
+            ffi::PyErr_Clear();
+            ffi::Py_DECREF(atexit);
+            return;
+        }
+        let name = ffi::PyUnicode_FromString(c"register".as_ptr());
+        // `PyObject_CallMethodOneArg` is not in the limited API; `PyObject_CallMethodObjArgs` is
+        // (variadic, terminated by NULL).
+        let res = ffi::PyObject_CallMethodObjArgs(
+            atexit,
+            name,
+            callable,
+            core::ptr::null_mut::<ffi::PyObject>(),
+        );
+        if res.is_null() {
             ffi::PyErr_Clear();
         } else {
-            if ffi::PyDict_SetItemString(interp_dict, GC_COLLECT_KEY.as_ptr(), collect) < 0 {
-                ffi::PyErr_Clear();
-            }
-            ffi::Py_DECREF(collect);
+            ffi::Py_DECREF(res);
         }
-        ffi::Py_DECREF(gc);
-    }
-    ffi::Py_DECREF(callable);
-    ffi::Py_DECREF(atexit);
-}
-
-impl<T> PerInterpreterCell<crate::Py<T>>
-where
-    T: crate::type_object::PyTypeCheck,
-{
-    /// This interpreter's `module_name.attr_name`, importing it here on first use.
-    ///
-    /// Per-interpreter because the imported object usually *is* per-interpreter: measured across
-    /// four sub-interpreters, `collections.abc.Sequence`, `decimal.Decimal`, `pathlib.Path`,
-    /// `uuid.UUID` and `zoneinfo.ZoneInfo` are five distinct heap types with ordinary refcounts —
-    /// one per interpreter. Caching one of them process-wide hands interpreter B an object owned
-    /// by interpreter A, which is the same defect this module exists to fix, one layer up.
-    pub fn import<'py>(
-        &self,
-        py: crate::Python<'py>,
-        module_name: &str,
-        attr_name: &str,
-    ) -> crate::PyResult<&crate::Bound<'py, T>> {
-        self.get_or_try_init(py, || {
-            use crate::types::any::PyAnyMethods;
-            let obj = py.import(module_name)?.getattr(attr_name)?.cast_into()?;
-            Ok(crate::Bound::unbind(obj))
-        })
-        .map(|v| v.bind(py))
+        if !name.is_null() {
+            ffi::Py_DECREF(name);
+        }
+        if ffi::PyDict_SetItemString(interp_dict, HOOK_KEY.as_ptr(), callable) < 0 {
+            ffi::PyErr_Clear();
+        }
+        // Resolve `gc.collect` now, while the interpreter is healthy; the hook only calls it.
+        let gc = ffi::PyImport_ImportModule(c"gc".as_ptr());
+        if gc.is_null() {
+            ffi::PyErr_Clear();
+        } else {
+            let collect = ffi::PyObject_GetAttrString(gc, c"collect".as_ptr());
+            if collect.is_null() {
+                ffi::PyErr_Clear();
+            } else {
+                if ffi::PyDict_SetItemString(interp_dict, GC_COLLECT_KEY.as_ptr(), collect) < 0 {
+                    ffi::PyErr_Clear();
+                }
+                ffi::Py_DECREF(collect);
+            }
+            ffi::Py_DECREF(gc);
+        }
+        ffi::Py_DECREF(callable);
+        ffi::Py_DECREF(atexit);
     }
 }
 

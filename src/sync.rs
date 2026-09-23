@@ -26,7 +26,6 @@ mod per_interpreter;
 pub use interpreter_handle::InterpreterHandle;
 pub use per_interpreter::PerInterpreterCell;
 
-
 pub mod critical_section;
 pub(crate) mod once_lock;
 

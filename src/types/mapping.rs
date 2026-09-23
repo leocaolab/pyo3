@@ -1,6 +1,5 @@
 use crate::conversion::IntoPyObject;
 use crate::err::PyResult;
-use crate::sync::PerInterpreterCell;
 use crate::ffi_ptr_ext::FfiPtrExt;
 #[cfg(feature = "experimental-inspect")]
 use crate::inspect::{type_hint_identifier, PyStaticExpr};
@@ -34,7 +33,7 @@ unsafe impl PyTypeInfo for PyMapping {
     #[inline]
     #[allow(clippy::redundant_closure_call)]
     fn type_object_raw(py: Python<'_>) -> *mut ffi::PyTypeObject {
-        static TYPE: PerInterpreterCell<Py<PyType>> = PerInterpreterCell::new();
+        static TYPE: PyOnceLock<Py<PyType>> = PyOnceLock::new();
         TYPE.import(py, "collections.abc", "Mapping")
             .unwrap()
             .as_type_ptr()

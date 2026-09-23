@@ -4,6 +4,8 @@
 //! extension's home interpreter (a process-wide fact, M1.3), and these tests need to set it
 //! up in a specific way without disturbing any other test.
 
+#![allow(dead_code)] // each test binary uses a subset of these helpers
+
 use pyo3::ffi;
 use pyo3::Python;
 
@@ -15,9 +17,10 @@ pub fn in_sub_interpreters<R: Send>(n: usize, f: impl Fn(usize, Python<'_>) -> R
     std::thread::scope(|scope| {
         let handles: Vec<_> = (0..n)
             .map(|i| {
+                // SAFETY: standard sub-interpreter lifecycle on a thread with no thread state:
+                // take main's GIL, create the interpreter (which detaches main's thread state
+                // and makes the new one current), run, end it, restore main's.
                 scope.spawn(move || unsafe {
-                    // Take main's GIL, create the interpreter (which detaches main's thread
-                    // state and makes the new one current), run, end it, restore main's.
                     let gstate = ffi::PyGILState_Ensure();
                     let main = ffi::PyThreadState_Get();
                     let config = ffi::_PyInterpreterConfig_INIT;
@@ -53,5 +56,6 @@ pub fn in_sub_interpreter<R: Send>(f: impl FnOnce(Python<'_>) -> R + Send) -> R 
 
 /// The id of the interpreter the calling thread is attached to.
 pub fn interp_id(_py: Python<'_>) -> i64 {
+    // SAFETY: `_py` witnesses that this thread is attached.
     unsafe { ffi::PyInterpreterState_GetID(ffi::PyInterpreterState_Get()) }
 }

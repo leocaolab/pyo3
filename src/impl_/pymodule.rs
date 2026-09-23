@@ -16,7 +16,6 @@ use core::{
     not(any(PyPy, GraalPy)),
     not(all(windows, Py_LIMITED_API, not(Py_3_10))),
 ))]
-
 #[cfg(all(
     not(any(PyPy, GraalPy)),
     not(all(windows, Py_LIMITED_API, not(Py_3_10))),
@@ -57,7 +56,8 @@ pub struct ModuleDef {
     name: &'static CStr,
     #[cfg(Py_3_15)]
     slots: &'static PyModuleSlots,
-    /// abi3 且编译期 < 3.12 时,占位 slot 是否已按运行时版本改写过。
+    /// abi3 built for < 3.12: whether the placeholder slot has been resolved for the running
+    /// interpreter yet.
     #[cfg(all(Py_LIMITED_API, not(Py_3_12)))]
     slot_patched: core::sync::atomic::AtomicBool,
     /// Initialized module object, cached to avoid reinitialization.
@@ -116,9 +116,10 @@ impl ModuleDef {
 
     #[cfg(not(all(Py_LIMITED_API, Py_GIL_DISABLED)))]
     pub fn init_multi_phase(&'static self) -> *mut ffi::PyObject {
-        // abi3 编译期不知道运行时是哪个 Python,而 `Py_mod_multiple_interpreters` 在 3.12
-        // 以下会让 CPython 报 unknown slot ID。所以那种构建里先占一个位,到这里 —— CPython
-        // 读 m_slots 之前的最后一刻 —— 按真实版本决定填上它还是抹成终止符。
+        // An abi3 build does not know at compile time which Python it will run on, and before
+        // 3.12 `Py_mod_multiple_interpreters` makes CPython raise `unknown slot ID`. So such a
+        // build reserves a placeholder slot, and here, the last moment before CPython reads
+        // `m_slots`, it is either filled in or removed according to the running version.
         #[cfg(all(Py_LIMITED_API, not(Py_3_12)))]
         unsafe {
             self.patch_multiple_interpreters_slot();
@@ -132,7 +133,8 @@ impl ModuleDef {
     #[cfg(all(Py_LIMITED_API, not(Py_3_12)))]
     unsafe fn patch_multiple_interpreters_slot(&'static self) {
         use core::sync::atomic::Ordering;
-        // 改写不是原子的(不支持时要把后面整段前移),所以只让一个线程做,且只做一次。
+        // The rewrite is not atomic (removing the slot shifts the rest of the array), so only
+        // one thread does it, once.
         if self
             .slot_patched
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -140,8 +142,9 @@ impl ModuleDef {
         {
             return;
         }
-        // `Py_Version` 是 3.11 才有的数据符号,abi3-py310 拿不到;`Py_GetVersion` 一直在
-        // 限定 API 里,返回 "3.14.6 (main, ...)" 这种字符串,取头两段就够。
+        // `Py_Version` is a 3.11 data symbol that abi3-py310 cannot reference; `Py_GetVersion`
+        // has always been in the limited API and returns e.g. "3.14.6 (main, ...)", of which
+        // the first two components are enough.
         let supported = {
             let v = ffi::Py_GetVersion();
             let mut major = 0i32;
@@ -153,7 +156,11 @@ impl ModuleDef {
                 match c {
                     b'0'..=b'9' => {
                         let d = (c - b'0') as i32;
-                        if seen_dot { minor = minor * 10 + d } else { major = major * 10 + d }
+                        if seen_dot {
+                            minor = minor * 10 + d
+                        } else {
+                            major = major * 10 + d
+                        }
                     }
                     b'.' if !seen_dot => seen_dot = true,
                     _ => break,
@@ -167,16 +174,16 @@ impl ModuleDef {
         loop {
             let slot = &mut *slots.add(i);
             if slot.slot == 0 {
-                return; // 没找到占位符 —— 这个构建没插它
+                return; // no placeholder: this build did not reserve one
             }
             if slot.slot == PLACEHOLDER_MULTIPLE_INTERPRETERS {
                 if supported {
                     slot.slot = ffi::Py_mod_multiple_interpreters;
-                    // 常量本身在 pyo3-ffi 里 cfg 到 Py_3_12,abi3-py310 编译期拿不到;
-                    // 它的值是固定的 2(CPython moduleobject.h)。
+                    // The constant is gated on Py_3_12 in pyo3-ffi, so abi3-py310 cannot name
+                    // it; its value is fixed at 2 (CPython's moduleobject.h).
                     slot.value = 2 as *mut core::ffi::c_void;
                 } else {
-                    // 3.12 之前:把占位符和它后面的整段前移一格,抹掉它
+                    // before 3.12: remove the placeholder by shifting the rest down one entry
                     let mut j = i;
                     loop {
                         let next = *slots.add(j + 1);
@@ -195,8 +202,9 @@ impl ModuleDef {
 
     /// Builds a module object directly. Used for [`#[pymodule]`][crate::pymodule] submodules.
     pub fn make_module(&'static self, py: Python<'_>) -> PyResult<Py<PyModule>> {
-        // 子模块不经过 `PyInit_`/`init_multi_phase`,占位 slot 要在这里也改写一次,
-        // 否则原样交给 CPython:SystemError: module ... uses unknown slot ID。
+        // Submodules do not go through `PyInit_` / `init_multi_phase`, so the placeholder slot
+        // has to be resolved here too; otherwise CPython gets it as is and raises
+        // `SystemError: module ... uses unknown slot ID`.
         #[cfg(all(Py_LIMITED_API, not(Py_3_12)))]
         unsafe {
             self.patch_multiple_interpreters_slot();
@@ -311,8 +319,9 @@ macro_rules! __pyo3_pyinit {
     ($symbol:literal, $def:path) => {};
 }
 
-/// 占位 slot id。CPython 从不使用负数 slot id,所以它绝不会被当成真 slot 传出去 ——
-/// [`ModuleDef::init_multi_phase`] 在 CPython 读到之前一定把它换掉或抹掉。
+/// Placeholder slot id. CPython never uses negative slot ids, so it cannot be mistaken for a
+/// real slot; [`ModuleDef::init_multi_phase`] always replaces or removes it before CPython
+/// reads it.
 #[cfg(all(Py_LIMITED_API, not(Py_3_12)))]
 const PLACEHOLDER_MULTIPLE_INTERPRETERS: c_int = -1;
 
@@ -322,8 +331,9 @@ pub type ModuleExecSlot = unsafe extern "C" fn(*mut ffi::PyObject) -> c_int;
 const MAX_SLOTS: usize =
     // Py_mod_exec
     1 +
-    // Py_mod_multiple_interpreters —— abi3 构建在编译期不知道运行时是哪个 Python,
-    // 所以即使 cfg 只到 3.10 也要把位置留出来,填不填由 `PyInit_` 时的版本决定。
+    // Py_mod_multiple_interpreters: an abi3 build does not know at compile time which Python
+    // it runs on, so the entry is reserved even when the cfg only reaches 3.10, and the version
+    // seen at `PyInit_` decides whether it is filled in.
     (cfg!(Py_3_12) || cfg!(all(Py_LIMITED_API, not(Py_3_12)))) as usize +
     // Py_mod_gil
     cfg!(Py_3_13) as usize +
@@ -427,8 +437,8 @@ impl PyModuleSlotsBuilder {
                 ffi::Py_MOD_PER_INTERPRETER_GIL_SUPPORTED,
             ))
         }
-        // abi3 且编译期 < 3.12:占一个位,值先留空。`ModuleDef::init_multi_phase`
-        // 在运行时按真实解释器版本决定是填上 slot 还是把它抹成终止符。
+        // abi3 built for < 3.12: reserve an entry with no value yet. `ModuleDef::init_multi_phase`
+        // fills it in or removes it at run time, according to the running interpreter's version.
         #[cfg(all(Py_LIMITED_API, not(Py_3_12)))]
         {
             self.push(PLACEHOLDER_MULTIPLE_INTERPRETERS, core::ptr::null_mut())

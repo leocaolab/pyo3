@@ -35,17 +35,30 @@ fn foreign_thread_attach_lands_in_the_home_interpreter() {
         let _module = pyo3::wrap_pymodule!(home_probe)(py); // executes the module here
         let home = interp_id(py);
         // a thread that has never had a Python thread state (rayon/tokio-like)
-        let landed = py.detach(|| std::thread::spawn(|| Python::attach(interp_id)).join().unwrap());
+        let landed = py.detach(|| {
+            std::thread::spawn(|| Python::attach(interp_id))
+                .join()
+                .unwrap()
+        });
 
         // Dropped on a thread with no thread state: queued for this (home) interpreter. Joined
         // without detaching, so nothing in this interpreter drains the queue before teardown.
         let flag = Py::new(py, DropFlag).unwrap();
         std::thread::spawn(move || drop(flag)).join().unwrap();
-        assert!(!DROPPED.load(Ordering::Acquire), "a detached drop must be queued, not applied");
+        assert!(
+            !DROPPED.load(Ordering::Acquire),
+            "a detached drop must be queued, not applied"
+        );
         (home, landed)
     });
-    assert_ne!(home, 0, "the module must have been executed in a sub-interpreter");
-    assert_eq!(landed, home, "a foreign-thread attach landed in interpreter {landed}, not home {home}");
+    assert_ne!(
+        home, 0,
+        "the module must have been executed in a sub-interpreter"
+    );
+    assert_eq!(
+        landed, home,
+        "a foreign-thread attach landed in interpreter {landed}, not home {home}"
+    );
     assert!(
         DROPPED.load(Ordering::Acquire),
         "the interpreter's queued decref was not applied at its teardown"

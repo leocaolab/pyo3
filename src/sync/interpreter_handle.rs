@@ -139,8 +139,8 @@ impl InterpreterHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::any::PyAnyMethods;
     use crate::platform::prelude::String;
+    use crate::types::any::PyAnyMethods;
     use crate::{Py, PyAny};
 
     /// The whole point: a foreign thread must land in the handle's interpreter, not the main one.

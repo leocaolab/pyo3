@@ -35,15 +35,29 @@ fn once_lock_value_is_per_interpreter() {
     static SYS: PyOnceLock<Py<PyModule>> = PyOnceLock::new();
 
     let main_sys = Python::attach(|py| {
-        addr(SYS.get_or_init(py, || py.import("sys").unwrap().unbind()).bind(py).as_any())
+        addr(
+            SYS.get_or_init(py, || py.import("sys").unwrap().unbind())
+                .bind(py)
+                .as_any(),
+        )
     });
     let (seen_before_init, cached, own) = in_sub_interpreter(|py| {
         let before = SYS.get(py).is_some();
-        let cached = addr(SYS.get_or_init(py, || py.import("sys").unwrap().unbind()).bind(py).as_any());
+        let cached = addr(
+            SYS.get_or_init(py, || py.import("sys").unwrap().unbind())
+                .bind(py)
+                .as_any(),
+        );
         (before, cached, addr(py.import("sys").unwrap().as_any()))
     });
-    assert!(!seen_before_init, "a sub-interpreter saw the main interpreter's PyOnceLock value");
-    assert_eq!(cached, own, "PyOnceLock must hold this interpreter's own object");
+    assert!(
+        !seen_before_init,
+        "a sub-interpreter saw the main interpreter's PyOnceLock value"
+    );
+    assert_eq!(
+        cached, own,
+        "PyOnceLock must hold this interpreter's own object"
+    );
     assert_ne!(cached, main_sys);
 }
 
@@ -57,12 +71,22 @@ fn intern_is_per_interpreter() {
     fn own(py: Python<'_>) -> usize {
         // this interpreter's own interned object for the same text, built at run time
         let text = String::from("pyo3_subinterp_regression_") + "interned";
-        addr(&py.import("sys").unwrap().getattr("intern").unwrap().call1((text,)).unwrap())
+        addr(
+            &py.import("sys")
+                .unwrap()
+                .getattr("intern")
+                .unwrap()
+                .call1((text,))
+                .unwrap(),
+        )
     }
     let main = Python::attach(|py| (interned(py), own(py)));
     assert_eq!(main.0, main.1);
     let sub = in_sub_interpreter(|py| (interned(py), own(py)));
-    assert_eq!(sub.0, sub.1, "intern! must return this interpreter's own interned str");
+    assert_eq!(
+        sub.0, sub.1,
+        "intern! must return this interpreter's own interned str"
+    );
     assert_ne!(sub.0, main.0);
 }
 
@@ -71,9 +95,17 @@ fn intern_is_per_interpreter() {
 #[test]
 fn conversion_class_cache_is_per_interpreter() {
     fn converted_is_own_path(py: Python<'_>) -> bool {
-        let obj = std::path::PathBuf::from("/tmp/x").into_pyobject(py).unwrap();
-        let own = py.import("pathlib").unwrap().getattr("Path").unwrap().call1(("/tmp/x",)).unwrap();
-        obj.get_type().is(&own.get_type())
+        let obj = std::path::PathBuf::from("/tmp/x")
+            .into_pyobject(py)
+            .unwrap();
+        let own = py
+            .import("pathlib")
+            .unwrap()
+            .getattr("Path")
+            .unwrap()
+            .call1(("/tmp/x",))
+            .unwrap();
+        obj.get_type().is(own.get_type())
     }
     assert!(Python::attach(converted_is_own_path));
     assert!(
@@ -85,7 +117,11 @@ fn conversion_class_cache_is_per_interpreter() {
 #[pyclass]
 struct RegressionProbe;
 
-pyo3::create_exception!(subinterp_regression, RegressionError, pyo3::exceptions::PyException);
+pyo3::create_exception!(
+    subinterp_regression,
+    RegressionError,
+    pyo3::exceptions::PyException
+);
 
 /// Ledger #1: a `#[pyclass]` type object is per interpreter. It is a heap type, so sharing one
 /// races its refcount across GILs.
@@ -93,7 +129,10 @@ pyo3::create_exception!(subinterp_regression, RegressionError, pyo3::exceptions:
 fn pyclass_type_object_is_per_interpreter() {
     let main = Python::attach(|py| addr(py.get_type::<RegressionProbe>().as_any()));
     let sub = in_sub_interpreter(|py| addr(py.get_type::<RegressionProbe>().as_any()));
-    assert_ne!(sub, main, "a sub-interpreter got the main interpreter's #[pyclass] type");
+    assert_ne!(
+        sub, main,
+        "a sub-interpreter got the main interpreter's #[pyclass] type"
+    );
 }
 
 /// Ledger #4: a `create_exception!` type is per interpreter.
@@ -101,7 +140,10 @@ fn pyclass_type_object_is_per_interpreter() {
 fn created_exception_type_is_per_interpreter() {
     let main = Python::attach(|py| addr(py.get_type::<RegressionError>().as_any()));
     let sub = in_sub_interpreter(|py| addr(py.get_type::<RegressionError>().as_any()));
-    assert_ne!(sub, main, "a sub-interpreter got the main interpreter's exception type");
+    assert_ne!(
+        sub, main,
+        "a sub-interpreter got the main interpreter's exception type"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -169,7 +211,10 @@ fn initializing_threads_is_per_interpreter() {
             let _ = py.get_type::<SlowInit>();
         }
     });
-    assert!(!TIMED_OUT.load(Ordering::Acquire), "the two interpreters never interleaved");
+    assert!(
+        !TIMED_OUT.load(Ordering::Acquire),
+        "the two interpreters never interleaved"
+    );
     assert!(
         !A_REENTERED.load(Ordering::Acquire),
         "another interpreter's finished init cleared this interpreter's reentrancy guard"
@@ -199,20 +244,24 @@ fn deferred_decref_is_applied_by_its_own_interpreter_only() {
             let obj = py.eval(c"object()", None, None).unwrap().unbind();
             let extra = obj.clone_ref(py);
             let raw = obj.as_ptr() as usize;
+            // SAFETY: attached; `obj` keeps the object alive.
             let before = unsafe { ffi::Py_REFCNT(raw as *mut ffi::PyObject) };
             let during = py.detach(move || {
                 drop(extra); // detached: queued, not applied
                 dropped_tx.send(()).unwrap();
                 go_rx.recv().unwrap();
-                // a racy read of a live object's refcount; nothing in this interpreter runs
-                // while this thread is detached from it
+                // SAFETY: a racy read of a live object's refcount (`obj` keeps it alive); nothing
+                // in this interpreter runs while this thread is detached from it.
                 unsafe { ffi::Py_REFCNT(raw as *mut ffi::PyObject) }
             });
             drop(obj);
             (before, during)
         });
         main_attach.join().unwrap();
-        assert_eq!(during, before, "another interpreter applied this interpreter's deferred decref");
+        assert_eq!(
+            during, before,
+            "another interpreter applied this interpreter's deferred decref"
+        );
     });
 }
 
@@ -238,8 +287,12 @@ const REGISTRY_KEY: &std::ffi::CStr = c"_pyo3_per_interpreter";
 /// deferred reference pool on the way back in, which would settle the very decrefs this is here
 /// to catch and turn the test green against the bug.
 fn drop_registry_as_cpython_would(_py: Python<'_>) {
+    // SAFETY: the caller is attached, so there is a current interpreter and thread state.
     let interp = unsafe { ffi::PyInterpreterState_Get() } as usize;
+    // SAFETY: as above; no Python object is touched until the thread state is restored below.
     let tstate = unsafe { ffi::PyEval_SaveThread() };
+    // SAFETY: a fresh thread state for `interp`, which stays alive: its only other thread is
+    // the caller, blocked in `join` below.
     let joined = std::thread::spawn(move || unsafe {
         let ts = ffi::PyThreadState_New(interp as *mut ffi::PyInterpreterState);
         assert!(!ts.is_null());
@@ -259,11 +312,13 @@ fn drop_registry_as_cpython_would(_py: Python<'_>) {
     })
     .join();
     // runs whether or not the thread panicked, so the caller's `Python` token is valid again
+    // SAFETY: pairs with the `PyEval_SaveThread` above.
     unsafe { ffi::PyEval_RestoreThread(tstate) };
     joined.unwrap();
 }
 
 fn refcount(_py: Python<'_>, obj: &Py<PyAny>) -> isize {
+    // SAFETY: `obj` is alive and the caller is attached.
     unsafe { ffi::Py_REFCNT(obj.as_ptr()) }
 }
 
@@ -288,7 +343,11 @@ fn registry_teardown_releases_its_values() {
 
         let before = refcount(py, &class);
         CELL.get_or_init(py, || class.clone_ref(py));
-        assert_eq!(refcount(py, &class), before + 1, "storing a value should hold one reference");
+        assert_eq!(
+            refcount(py, &class),
+            before + 1,
+            "storing a value should hold one reference"
+        );
 
         drop_registry_as_cpython_would(py);
         assert_eq!(
@@ -311,7 +370,8 @@ fn registry_teardown_releases_its_values() {
 fn cell_is_empty_after_teardown() {
     in_sub_interpreter(|py| {
         for _ in 0..512 {
-            let pad: &'static PerInterpreterCell<u64> = Box::leak(Box::new(PerInterpreterCell::new()));
+            let pad: &'static PerInterpreterCell<u64> =
+                Box::leak(Box::new(PerInterpreterCell::new()));
             pad.get_or_init(py, || 0);
         }
         static CELL: PerInterpreterCell<Py<PyAny>> = PerInterpreterCell::new();

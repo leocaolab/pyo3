@@ -139,6 +139,7 @@ pub(crate) unsafe fn attach_home(interp: *mut ffi::PyInterpreterState) -> *mut f
 /// # Safety
 /// `tstate` must be the current thread state, created by [`attach_home`].
 pub(crate) unsafe fn detach_home(tstate: *mut ffi::PyThreadState) {
+    // SAFETY: the caller guarantees `tstate` is current and came from `attach_home`.
     unsafe {
         ffi::PyThreadState_Clear(tstate);
         let detached = ffi::PyEval_SaveThread();

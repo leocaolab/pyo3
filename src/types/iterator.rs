@@ -1,6 +1,5 @@
 use crate::ffi_ptr_ext::FfiPtrExt;
 use crate::py_result_ext::PyResultExt;
-use crate::sync::PerInterpreterCell;
 use crate::sync::PyOnceLock;
 #[cfg(Py_LIMITED_API)]
 use crate::types::PyAnyMethods;
@@ -36,7 +35,7 @@ pub struct PyIterator(PyAny);
 pyobject_native_type_core!(
     PyIterator,
     |py| {
-        static TYPE: PerInterpreterCell<Py<PyType>> = PerInterpreterCell::new();
+        static TYPE: PyOnceLock<Py<PyType>> = PyOnceLock::new();
         TYPE.import(py, "collections.abc", "Iterator")
             .unwrap()
             .as_type_ptr()
