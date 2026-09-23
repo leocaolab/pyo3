@@ -81,5 +81,19 @@ for d in ("shared", "copies"):
     expect("pool_probe", rows, "so_fork", d, 3, r"^A, on return \(\d+×\)$", "detach")
 expect("pool_probe", rows, "so_fork", "copies", 3, r"^pending, then A \(\d+×\)$", "foreign")
 
+# Ledger #7 / #10: wrap_pymodule! submodules load in every interpreter, with their own module
+# and class objects; on abi3 that also proves the slot placeholder does not leak into them.
+for b in ("sm_base", "sm_fork", "sm_base_abi3", "sm_fork_abi3"):
+    p = subprocess.run([sys.executable, os.path.join(HERE, "submodule.py"), os.path.join(HERE, b)],
+                       capture_output=True, text=True, timeout=600)
+    print(f"\n### submodule.py {b} (exit {p.returncode})\n{p.stdout}")
+    if b.startswith("sm_base"):
+        if "成功 1/6" not in p.stdout:                       # control: upstream refuses 5 of 6
+            failures.append(f"submodule {b}: control no longer shows the pyo3#576 refusal")
+    else:
+        for want in ("成功 6/6", "子模块对象     6 个不同地址", "子模块里的类    6 个不同地址"):
+            if want not in p.stdout:
+                failures.append(f"submodule {b}: missing {want!r}")
+
 print("\n" + ("\n".join("FAIL " + f for f in failures) if failures else "all verdicts as expected"))
 sys.exit(1 if failures else 0)

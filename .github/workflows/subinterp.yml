@@ -38,12 +38,16 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: unit-${{ matrix.python }}
-      - name: unit tests (parallel, as a regression for the main-registry teardown bug)
+      - name: unit tests (parallel)
         run: cargo test --lib --release
         env:
           PYO3_PYTHON: python
       - name: unit tests (serial)
         run: cargo test --lib --release -- --test-threads=1
+        env:
+          PYO3_PYTHON: python
+      - name: sub-interpreter regression binaries (one process each; they set the home interpreter)
+        run: cargo test --release --test test_subinterp_isolation --test test_subinterp_home --test test_subinterp_shared --test test_subinterp_teardown
         env:
           PYO3_PYTHON: python
 

@@ -363,32 +363,39 @@ north-star path. Where the 52 KB goes is not investigated.
 
 ## Bug ledger
 
-Every defect this branch fixed, from `git log dfdbc46..`. The last column is what
-M5.2 (#15) fills in: a test that fails on the code before the fix. "Bench only"
-means a script in `subinterp-bench/` catches it, but `cargo test` does not.
+Every defect this branch fixed, from `git log dfdbc46..`. The last column is the test
+that fails on the code before the fix (M5.2, #15). ✔ = mutation-checked: the fix
+was put back to its pre-fix form, and the test failed. CI runs all of them
+(`.github/workflows/subinterp.yml`).
 
-| # | defect | fixed in | evidence | regression test in `cargo test` |
+Every test that creates a sub-interpreter is an integration test (`tests/test_subinterp_*.rs`,
+one process per file), never a lib unit test. Once a process has created a sub-interpreter,
+CPython disables `PyGILState_Check` for good (it always returns 1). That breaks the upstream
+unit test `test_acquire_gil`, which went unnoticed only because `marker::…` happens to sort
+before the tests that created one.
+
+| # | defect | fixed in | evidence | regression test |
 |---|---|---|---|---|
-| 1 | `#[pyclass]` type objects are one per process: every interpreter shares one heap type and races its refcount | `07b0178` | 8 interpreters → 1 type address, refcount 8→10→12→14 | — |
-| 2 | `PerInterpreterCell` is zero-sized, so two cells in one struct share a key and overwrite each other (null type pointer, 850 tests abort) | `f6a86a4` | the upstream suite | `neighbouring_cells_have_distinct_slots` |
-| 3 | per-interpreter values are never reclaimed at teardown (3.66 MB per interpreter, 2.5 GB over 800) | `cc09cbc` | `leak.py` | — |
-| 4 | `create_exception!` types are one per process | `de6c9a3` | 8 interpreters → 1 exception type | — |
-| 5 | registry values are dropped unattached and deferred into a pool nothing applies (2.6 MB per interpreter, unbounded) | `7b90c8b` | `leak.py` | `registry_teardown_releases_its_values` |
-| 6 | a stale cached registry base pointer survives teardown | `799ab51` | — | `cell_is_empty_after_teardown` |
-| 7 | the module object is cached per process, and a guard refuses every other interpreter (`ImportError … #576`) | `cd020f3` | 6/6 interpreters import | — |
-| 8 | the module does not declare `Py_MOD_PER_INTERPRETER_GIL_SUPPORTED`, so strict mode refuses it | `3840e20` | strict mode 6/6 | — |
-| 9 | on abi3 that slot is never emitted, because the cfg follows the minimum version | `95082f3` | polars abi3-py310, strict 4/4 | — |
-| 10 | the first fix for #9 leaked the placeholder slot into submodules (`SystemError: unknown slot ID`) | `95082f3` | polars `_ir_nodes` | — |
-| 11 | the teardown path uses non-limited-API calls, so abi3 does not compile | `4a1c57a` | abi3 build | — (abi3 build in CI, M5.1) |
-| 12 | 11 stdlib classes cached per process by the conversion layer (`Decimal`, `Path`, `IPv4Address`, …) | `d8cba90` | `audit_caches.py`, `conv_probe.py` | — |
-| 13 | `Python::attach` on a foreign thread lands in the **main** interpreter | `dd31c43` + `5fec073` | `attach_probe.py`, polars writes 16/16 | home state machine only (`home.rs`, 5 pure tests) |
-| 14 | `intern!` is one per process, and interned strings are mortal on 3.12–3.14 | `3c5d769` | `cache_probe.py` 1/4 → 4/4 | — |
-| 15 | `PyOnceLock` statics are one per process (polars bug B: wrong `Int64`; bug C: segfault on teardown) | `03eabbd` | `polars_bugb_check.py`, `teardown_check.py` | — |
-| 16 | `LazyTypeObject.initializing_threads` is process-wide: one interpreter's init clears another's in-flight entry, which deadlocks | `03eabbd` | 4 interpreters importing polars at once | — |
-| 17 | the main interpreter's registry is torn down mid-process by 3 unit tests (parallel runs segfault) | `03eabbd` | the unit suite | the 3 tests themselves |
-| 18 | the deferred-decref pool is one per process: B applies A's decrefs (bug A) | `629bbc1` | `pool_probe.py` 5/5 → 0/5 | — |
-| 19 | an unknown-owner drop during unwinding aborts the process (found while fixing #18) | `629bbc1` | `pool_soak.py` shared, exit 134 → `PanicException` | — |
-| 20 | teardown imports `gc` inside `Py_EndInterpreter` (hardening; the crash blamed on it was #15) | `f4faf9d` | `teardown_check.py` | — |
+| 1 | `#[pyclass]` type objects are one per process: every interpreter shares one heap type and races its refcount | `07b0178` | 8 interpreters → 1 type address, refcount 8→10→12→14 | `tests/test_subinterp_isolation.rs` `pyclass_type_object_is_per_interpreter` ✔ |
+| 2 | `PerInterpreterCell` is zero-sized, so two cells in one struct share a key and overwrite each other (null type pointer, 850 tests abort) | `f6a86a4` | the upstream suite | `tests/test_subinterp_isolation.rs` `neighbouring_cells_have_distinct_slots` (not mutation-checked) |
+| 3 | per-interpreter values are never reclaimed at teardown (3.66 MB per interpreter, 2.5 GB over 800) | `cc09cbc` | `leak.py` | `tests/test_subinterp_isolation.rs` `registry_teardown_releases_its_values` (the decref); RSS slope: `leak.py` (bench only) |
+| 4 | `create_exception!` types are one per process | `de6c9a3` | 8 interpreters → 1 exception type | `tests/test_subinterp_isolation.rs` `created_exception_type_is_per_interpreter` ✔ |
+| 5 | registry values are dropped unattached and deferred into a pool nothing applies (2.6 MB per interpreter, unbounded) | `7b90c8b` | `leak.py` | `tests/test_subinterp_isolation.rs` `registry_teardown_releases_its_values` ✔ |
+| 6 | a stale cached registry base pointer survives teardown | `799ab51` | — | `tests/test_subinterp_isolation.rs` `cell_is_empty_after_teardown` ✔ (needs a large registry to be sensitive, see the test) |
+| 7 | the module object is cached per process, and a guard refuses every other interpreter (`ImportError … #576`) | `cd020f3` | 6/6 interpreters import | `tests/test_subinterp_shared.rs` ✔; submodules: `ci_verdicts.py` (`submodule.py`) |
+| 8 | the module does not declare `Py_MOD_PER_INTERPRETER_GIL_SUPPORTED`, so strict mode refuses it | `3840e20` | strict mode 6/6 | CI probes: every fork build loads in strict mode (no override) — `ci_verdicts.py` |
+| 9 | on abi3 that slot is never emitted, because the cfg follows the minimum version | `95082f3` | polars abi3-py310, strict 4/4 | CI probes: `so_fork_abi3` / `sm_fork_abi3` load strict — `ci_verdicts.py` |
+| 10 | the first fix for #9 leaked the placeholder slot into submodules (`SystemError: unknown slot ID`) | `95082f3` | polars `_ir_nodes` | CI probes: `sm_fork_abi3` 6/6 — `ci_verdicts.py` |
+| 11 | the teardown path uses non-limited-API calls, so abi3 does not compile | `4a1c57a` | abi3 build | CI `abi3-py310 build` job |
+| 12 | 11 stdlib classes cached per process by the conversion layer (`Decimal`, `Path`, `IPv4Address`, …) | `d8cba90` | `audit_caches.py`, `conv_probe.py` | `tests/test_subinterp_isolation.rs` `conversion_class_cache_is_per_interpreter` ✔ |
+| 13 | `Python::attach` on a foreign thread lands in the **main** interpreter | `dd31c43` + `5fec073` | `attach_probe.py`, polars writes 16/16 | `tests/test_subinterp_home.rs` ✔ (home) and `tests/test_subinterp_shared.rs` ✔ (ambiguous → loud) |
+| 14 | `intern!` is one per process, and interned strings are mortal on 3.12–3.14 | `3c5d769` | `cache_probe.py` 1/4 → 4/4 | `tests/test_subinterp_isolation.rs` `intern_is_per_interpreter` ✔ |
+| 15 | `PyOnceLock` statics are one per process (polars bug B: wrong `Int64`; bug C: segfault on teardown) | `03eabbd` | `polars_bugb_check.py`, `teardown_check.py` | `tests/test_subinterp_isolation.rs` `once_lock_value_is_per_interpreter` ✔ |
+| 16 | `LazyTypeObject.initializing_threads` is process-wide: one interpreter's init clears another's in-flight entry, which deadlocks | `03eabbd` | 4 interpreters importing polars at once | `tests/test_subinterp_isolation.rs` `initializing_threads_is_per_interpreter` ✔ |
+| 17 | the main interpreter's registry is torn down mid-process by 3 unit tests (parallel runs segfault) | `03eabbd` | the unit suite | structural: no sub-interpreter is created in the lib's unit-test process any more (every such test is in `tests/test_subinterp_*.rs`) |
+| 18 | the deferred-decref pool is one per process: B applies A's decrefs (bug A) | `629bbc1` | `pool_probe.py` 5/5 → 0/5 | `tests/test_subinterp_isolation.rs` `deferred_decref_is_applied_by_its_own_interpreter_only` ✔; teardown drain: `tests/test_subinterp_home.rs` ✔ |
+| 19 | an unknown-owner drop during unwinding aborts the process (found while fixing #18) | `629bbc1` | `pool_soak.py` shared, exit 134 → `PanicException` | `tests/test_subinterp_shared.rs` ✔ |
+| 20 | teardown imports `gc` inside `Py_EndInterpreter` (hardening; the crash blamed on it was #15) | `f4faf9d` | `teardown_check.py` | `tests/test_subinterp_teardown.rs` ✔ |
 
 Not counted: `73f61bb` (a fix attempt that never executed, removed in `2a9c032`),
 `e4174d8` (3.12-only datetime fix, reverted in `9e07f7f`: out of scope), and the
