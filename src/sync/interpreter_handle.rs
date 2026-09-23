@@ -69,12 +69,14 @@ impl InterpreterHandle {
 
     /// Runs `f` attached to this handle's interpreter, whichever thread calls it.
     ///
-    /// If the calling thread is already attached to this same interpreter, `f` runs directly. On
-    /// any other thread a fresh thread state is created for this interpreter, used, and destroyed.
+    /// If the calling thread is attached to this same interpreter, `f` runs directly. If its thread
+    /// state for this interpreter exists but is detached (inside `py.detach`, or a worker between
+    /// requests), that thread state is restored for `f` and detached again afterwards. On a thread
+    /// with no thread state, a fresh one is created for this interpreter, used, and destroyed.
     ///
     /// # Panics
     ///
-    /// Panics if the thread is already attached to a *different* interpreter. Attaching to two
+    /// Panics if the thread is attached, or bound, to a *different* interpreter. Attaching to two
     /// interpreters at once is not a thing CPython supports, and doing it silently is how the
     /// class of bug this type exists for gets written in the first place.
     ///
@@ -89,20 +91,48 @@ impl InterpreterHandle {
     where
         F: for<'py> FnOnce(Python<'py>) -> R,
     {
-        let current = crate::internal::state::current_interpreter_or_null();
-
-        if current == self.0 {
-            // Already here. Take the fast path, and tell PyO3 the thread is attached so that
-            // `Py<T>`'s `Drop` decrefs instead of deferring.
+        let current = crate::internal::state::current_tstate_or_null();
+        if !current.is_null() {
+            // SAFETY: a thread state is current, so this thread holds its interpreter's GIL.
+            let interp = unsafe { ffi::PyInterpreterState_Get() };
+            assert!(
+                interp == self.0,
+                "this thread is attached to a different interpreter; detach from it before \
+                 attaching to another"
+            );
+            // Already here, with the GIL. Tell PyO3 the thread is attached so that `Py<T>`'s
+            // `Drop` decrefs instead of deferring.
             // SAFETY: a thread state for this interpreter is current.
             let _attached = unsafe { AssumeAttached::new() };
             // SAFETY: as above.
             return f(unsafe { Python::assume_attached() });
         }
+
+        // Not attached. A thread that is *bound* to this interpreter but detached (inside
+        // `py.detach`, or a worker between requests) gets its own thread state back rather than
+        // a second one: that keeps its thread-locals, and it is what the thread will resume with.
+        let bound = crate::internal::state::current_interpreter_or_null();
+        if bound == self.0 {
+            // SAFETY: the GILState thread state is this thread's, belongs to this interpreter,
+            // and is not current (checked above).
+            let tstate = unsafe { ffi::PyGILState_GetThisThreadState() };
+            // SAFETY: as above.
+            unsafe { ffi::PyEval_RestoreThread(tstate) };
+            let result = {
+                // SAFETY: `tstate` is now current.
+                let _attached = unsafe { AssumeAttached::new() };
+                // SAFETY: as above.
+                f(unsafe { Python::assume_attached() })
+            };
+            // SAFETY: `tstate` is current; hand it back detached, as it was found.
+            let detached = unsafe { ffi::PyEval_SaveThread() };
+            debug_assert_eq!(detached, tstate);
+            return result;
+        }
         assert!(
-            current.is_null(),
-            "this thread is attached to a different interpreter; detach from it before attaching \
-             to another"
+            bound.is_null(),
+            "this thread's thread state belongs to a different interpreter; attach to that one, \
+             or use a thread that has none"
         );
 
         // SAFETY: the caller guarantees the interpreter is alive. `PyThreadState_New` does not
@@ -167,6 +197,27 @@ mod tests {
         .unwrap();
 
         assert_eq!(got, "from the owning interpreter");
+    }
+
+    /// A thread whose thread state for this interpreter exists but is *detached* — inside
+    /// `py.detach`, or a worker that saved its thread state between requests — must get the GIL
+    /// back for `f`. The fast path used to fire on the thread's bound thread state alone and ran
+    /// `f` without the GIL (SUBINTERP-FIXES.md ledger #22).
+    #[test]
+    fn attach_inside_detach_holds_the_gil() {
+        Python::attach(|py| {
+            let handle = InterpreterHandle::current(py);
+            let (held, same) = py.detach(|| {
+                handle.attach(|py2| {
+                    // SAFETY: always safe to call; no sub-interpreter exists in this binary, so
+                    // `PyGILState_Check` is live and reports whether this thread holds the GIL.
+                    let held = unsafe { ffi::PyGILState_Check() };
+                    (held, InterpreterHandle::current(py2) == handle)
+                })
+            });
+            assert_eq!(held, 1, "f ran without the GIL");
+            assert!(same);
+        });
     }
 
     /// Attaching from a thread that is already there must not create a second thread state.

@@ -17,7 +17,7 @@ use pyo3::prelude::*;
 use pyo3::sync::{PerInterpreterCell, PyOnceLock};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
-use subinterp_util::{in_sub_interpreter, in_sub_interpreters};
+use subinterp_util::{in_sub_interpreter, in_sub_interpreters, interp_id};
 
 /// Address of a Python object, so it can leave the interpreter it belongs to.
 fn addr(obj: &Bound<'_, PyAny>) -> usize {
@@ -446,3 +446,30 @@ fn neighbouring_cells_have_distinct_slots() {
     });
 }
 
+// ---------------------------------------------------------------------------------------------
+// Ledger #22: `InterpreterHandle::attach` on a thread whose thread state for that interpreter is
+// bound but detached. Pyronova's workers are exactly this: a worker thread bound to its own
+// sub-interpreter, detached between requests or inside `py.detach`. The fast path used to fire on
+// the binding alone and ran `f` with no thread state current, i.e. without the GIL.
+
+#[test]
+fn interpreter_handle_attach_inside_detach_restores_the_thread_state() {
+    let (sub, got, current) = in_sub_interpreter(|py| {
+        let handle = pyo3::sync::InterpreterHandle::current(py);
+        let sub = interp_id(py);
+        let (got, current) = py.detach(|| {
+            handle.attach(|py2| {
+                // SAFETY: never fatal; null when no thread state is current.
+                let tstate = unsafe { ffi::PyThreadState_GetUnchecked() };
+                (interp_id(py2), !tstate.is_null())
+            })
+        });
+        (sub, got, current)
+    });
+    assert_ne!(sub, 0, "must run in a sub-interpreter");
+    assert!(
+        current,
+        "f ran with no thread state current (without the GIL)"
+    );
+    assert_eq!(got, sub, "f ran in interpreter {got}, not {sub}");
+}

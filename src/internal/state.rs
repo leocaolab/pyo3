@@ -286,8 +286,35 @@ impl Drop for AttachGuard {
     }
 }
 
-/// The interpreter this thread's GILState thread state belongs to, or null. Used by
-/// `InterpreterHandle::attach`.
+/// The thread state that is *current* on this thread (attached, holding its interpreter's GIL),
+/// or null.
+///
+/// This is not the same as the thread's GILState thread state: a thread keeps that binding while
+/// detached (inside `py.detach`, or a worker that saved its thread state), and treating "bound" as
+/// "attached" runs code without the GIL (SUBINTERP-FIXES.md ledger #22).
+///
+/// The limited API has no null-returning way to ask, so there PyO3's own attach count stands in:
+/// a thread that took the GIL through raw C calls without telling PyO3 reads as detached.
+#[inline]
+pub(crate) fn current_tstate_or_null() -> *mut ffi::PyThreadState {
+    #[cfg(not(Py_LIMITED_API))]
+    {
+        // SAFETY: explicitly null-returning; never fatal.
+        unsafe { ffi::PyThreadState_GetUnchecked() }
+    }
+    #[cfg(Py_LIMITED_API)]
+    {
+        if thread_is_attached() {
+            // SAFETY: PyO3 has this thread attached, so a thread state is current.
+            unsafe { ffi::PyThreadState_Get() }
+        } else {
+            core::ptr::null_mut()
+        }
+    }
+}
+
+/// The interpreter this thread's GILState thread state belongs to, or null. That is the thread
+/// state the thread is *bound* to; it may be detached. See [`current_tstate_or_null`].
 ///
 /// Not `PyInterpreterState_Get`: that is fatal without a thread state, so it cannot be used to
 /// ask. `PyGILState_GetThisThreadState` is in the stable ABI and returns null instead.
