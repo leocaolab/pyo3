@@ -17,6 +17,22 @@ Changes in this fork relative to upstream PyO3. Upstream's own changes are in
 The goal is own-GIL sub-interpreters (PEP 684): one extension used by several
 interpreters in one process, each running under its own GIL.
 
+## Unreleased
+
+### Fixed
+
+- **Two PyO3 extensions in one interpreter** (#21). The per-interpreter registry was kept
+  under one fixed key in the interpreter dict, but every extension `.so` numbers its slots on
+  its own. The second PyO3 extension loaded into an interpreter read the first one's slots:
+  pyronova's engine followed by a fork-built polars segfaulted, in the main interpreter or a
+  sub-interpreter, in either order. Only the first extension's teardown hook was registered, so
+  the second one's values and queued decrefs were never released at `Py_EndInterpreter`. The
+  keys are now per extension copy.
+- **`InterpreterHandle::attach` on a detached thread** (#22). It used the thread state the
+  thread is *bound* to, not the one that is *current*. Inside `py.detach`, or on a worker that
+  saved its thread state between requests, it ran the closure without the GIL. It now restores
+  that thread state for the closure and detaches it again. `Python::attach` was not affected.
+
 ## `subinterp-2026-09-23`
 
 To use it:

@@ -396,6 +396,8 @@ before the tests that created one.
 | 18 | the deferred-decref pool is one per process: B applies A's decrefs (bug A) | `629bbc1` | `pool_probe.py` 5/5 → 0/5 | `tests/test_subinterp_isolation.rs` `deferred_decref_is_applied_by_its_own_interpreter_only` ✔; teardown drain: `tests/test_subinterp_home.rs` ✔ |
 | 19 | an unknown-owner drop during unwinding aborts the process (found while fixing #18) | `629bbc1` | `pool_soak.py` shared, exit 134 → `PanicException` | `tests/test_subinterp_shared.rs` ✔ |
 | 20 | teardown imports `gc` inside `Py_EndInterpreter` (hardening; the crash blamed on it was #15) | `f4faf9d` | `teardown_check.py` | `tests/test_subinterp_teardown.rs` ✔ |
+| 21 | the per-interpreter registry, teardown-hook and `gc.collect` keys are one fixed name, but every extension copy has its own slot numbering: the second PyO3 extension in an interpreter reads the first one's slots (segfault), and only the first copy's teardown hook is registered | `a56473b` | pyronova engine + fork-built polars in one interpreter: segfault in `add_class::<PyDataFrame>`; two copies of `abi3t.so`: exit -11 | CI probe `two_copies.py` (main + 4 sub-interpreters) — `ci_verdicts.py` ✔ |
+| 22 | `InterpreterHandle::attach` treats the thread's *bound* thread state as attached: inside `py.detach` (or a worker between requests) it ran `f` without the GIL | `3573c06` | `PyInterpreterState_Get: … the GIL is released` abort | `sync::interpreter_handle::tests::attach_inside_detach_holds_the_gil` ✔ and `tests/test_subinterp_isolation.rs` `interpreter_handle_attach_inside_detach_restores_the_thread_state` ✔ |
 
 Not counted: `73f61bb` (a fix attempt that never executed, removed in `2a9c032`),
 `e4174d8` (3.12-only datetime fix, reverted in `9e07f7f`: out of scope), and the
