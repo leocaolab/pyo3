@@ -88,8 +88,11 @@ for b in ("sm_base", "sm_fork", "sm_base_abi3", "sm_fork_abi3"):
                        capture_output=True, text=True, timeout=600)
     print(f"\n### submodule.py {b} (exit {p.returncode})\n{p.stdout}")
     if b.startswith("sm_base"):
-        if "成功 1/6" not in p.stdout:                       # control: upstream refuses 5 of 6
-            failures.append(f"submodule {b}: control no longer shows the pyo3#576 refusal")
+        # control: upstream refuses 5 of 6 with the pyo3#576 ImportError, or (seen on macOS CI)
+        # aborts outright. A signal death counts; an ordinary error exit (a missing build, a
+        # Python traceback) does not.
+        if "成功 1/6" not in p.stdout and p.returncode >= 0:
+            failures.append(f"submodule {b}: control no longer shows the pyo3#576 refusal (exit {p.returncode})")
     else:
         for want in ("成功 6/6", "子模块对象     6 个不同地址", "子模块里的类    6 个不同地址"):
             if want not in p.stdout:
