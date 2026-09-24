@@ -8,6 +8,77 @@
 [![discord server](https://img.shields.io/discord/1209263839632424990?logo=discord)](https://discord.gg/33kcChzH7f)
 [![contributing notes](https://img.shields.io/badge/contribute-on%20github-Green?logo=github)](https://github.com/PyO3/pyo3/blob/main/Contributing.md)
 
+> ## This fork: PyO3 for own-GIL sub-interpreters
+>
+> **leocaolab/pyo3** is PyO3 with its process-global state moved **per interpreter**, so
+> PyO3 extensions load and run correctly in own-GIL sub-interpreters (PEP 684): several
+> interpreters in one process, each with its own GIL, running in parallel on several
+> cores. Upstream PyO3 assumes one interpreter per process. Crate version stays `0.29.2`;
+> releases are git tags. Supported Python: 3.13 and 3.14.
+>
+> ```toml
+> [patch.crates-io]
+> pyo3 = { git = "https://github.com/leocaolab/pyo3", tag = "subinterp-2026-09-23.2" }
+> pyo3-ffi = { git = "https://github.com/leocaolab/pyo3", tag = "subinterp-2026-09-23.2" }
+> pyo3-macros = { git = "https://github.com/leocaolab/pyo3", tag = "subinterp-2026-09-23.2" }
+> pyo3-macros-backend = { git = "https://github.com/leocaolab/pyo3", tag = "subinterp-2026-09-23.2" }
+> pyo3-build-config = { git = "https://github.com/leocaolab/pyo3", tag = "subinterp-2026-09-23.2" }
+> ```
+>
+> ### How it differs from upstream PyO3
+>
+> 22 defects fixed, each with a regression test that fails on the unfixed code. Numbers
+> refer to the [bug ledger](SUBINTERP-FIXES.md#bug-ledger); history is in
+> [`CHANGELOG-FORK.md`](CHANGELOG-FORK.md).
+>
+> | Area | Upstream PyO3 | This fork |
+> |---|---|---|
+> | Type objects (#1, #4) | one `#[pyclass]` / `create_exception!` type per process: every interpreter shares it and races its refcount | one per interpreter |
+> | Module object (#7) | cached per process; a second interpreter gets `ImportError` (#576) | one per interpreter, and submodules too |
+> | Caches (#12, #14, #15, #16) | `PyOnceLock`, `intern!` (mortal on 3.12–3.14), the conversion layer's stdlib classes and the type-init thread list are per process: wrong-interpreter objects (polars got another interpreter's `Int64`), teardown segfaults, a deadlock when 4 interpreters import polars at once | all per interpreter |
+> | Deferred decrefs (#18, #19) | one pool per process: interpreter B applies A's decrefs (silent heap corruption on glibc) | one pool per interpreter; the owner is recorded when the decref is queued |
+> | Foreign threads (#13, #22) | `Python::attach` on a thread with no thread state (rayon, tokio) lands in the **main** interpreter | lands in the interpreter that executed this extension copy's module; fails loudly if that is ambiguous. `InterpreterHandle` attaches to an explicit interpreter from any thread |
+> | Teardown (#3, #5, #6, #20) | per-interpreter values are never reclaimed (2.6–3.7 MB per interpreter, unbounded) | released at `Py_EndInterpreter` |
+> | Declaration (#8–#11) | no `Py_MOD_PER_INTERPRETER_GIL_SUPPORTED`, so strict mode refuses the module (abi3 included) | declared by every `#[pymodule]`, abi3 included |
+> | Several extensions (#21) | — | each extension copy keeps its own registry, so two fork-built extensions share one process (e.g. pyronova + polars) |
+>
+> **Scaling:** creating objects on 12 own-GIL workers scales 9.54× on a MacBook and 6.70×
+> on an 8-core Linux box; upstream scales 1.20× / 1.48×, because every interpreter shares
+> one type object and every core contends on its refcount ([`JOURNAL.md`](JOURNAL.md)).
+>
+> ### What it means for an application: polars
+>
+> polars is pure Rust on PyO3, so everything it hits in a sub-interpreter is a PyO3
+> problem. Measured with polars 1.43.2 on Python 3.14, own-GIL sub-interpreters
+> ([`subinterp-bench/POLARS.md`](subinterp-bench/POLARS.md), ledger numbers in brackets):
+>
+> | polars feature | built on upstream PyO3 | built on this fork |
+> |---|---|---|
+> | `import polars` in several interpreters | strict mode 0/4; with the override 1/4, the rest raise `ImportError` (#576, submodules) | 4/4 in strict mode, no process-wide switch (#7–#10) |
+> | Core API in a sub-interpreter: `DataFrame`/`Series`, `lazy().collect()`, streaming, `group_by().agg()`, `join`, `over`, `when/then`, `.str`/`.dt`, `pivot`, `rolling_*`, `read_csv/json/ndjson`, `scan_csv`, `write_parquet(BytesIO)` | can't get past the import | 21/22 worked when measured; the 22nd was `write_csv` to a file-like object, the thread-pool write path in the last row |
+> | Parallel work across interpreters | — | 8 interpreters × filter/`group_by`/`agg`: 8× the work in 1.25× the wall clock, each result checked exactly; a SkyTrade-style `rolling_*().over()` workload reaches ~18 M rows/s |
+> | Creating objects from several interpreters at once | SIGSEGV / SIGABRT (shared type refcount) | correct (#1) |
+> | Several interpreters importing polars at the same time | — | no deadlock (#16; it deadlocked with 4) |
+> | Tearing an interpreter down after parallel compute | — | clean, 10/10 (#15; segfaulted 3/3 with ≥2 interpreters) |
+> | Frequent writes from 8 interpreters | — | no cross-interpreter frees (#18; crashed within 1–4 s) |
+> | `map_elements` with `return_dtype=pl.Int64` | — | the callback gets its own interpreter's `Int64` (#15; half the workers got another interpreter's class: `cannot parse input of type 'Int64' into Polars data type (given: Int64)`) |
+> | Python UDFs polars runs on its own thread pool: `group_by().agg(pl.col(..).map_elements(..))`, `group_by().agg(..map_batches(..))` | the callback runs in the **main** interpreter: the `Int64` error above, or an abort | with one polars copy per interpreter, every callback runs in its own interpreter, 7/7 UDF paths (#13, #21); one copy shared by several interpreters fails loudly instead |
+> | Writing to a Python file-like object: `write_csv/ndjson/parquet/ipc(custom file-like)` | `write()` runs in the main interpreter on a rayon thread; the process aborts (`pointer being freed was not allocated`) | with one copy per interpreter, every write lands in its own interpreter, 16/16 (#13) |
+>
+> The PyPI polars wheel is built on upstream PyO3, so none of the right-hand column
+> applies to it: build polars from source on this fork
+> ([leocaolab/polars](https://github.com/leocaolab/polars), branch `subinterp`: upstream
+> polars plus the `[patch.crates-io]` pin, no polars code changes).
+> [Pyronova](https://github.com/leocaolab/pyronova) runs this fork in production and
+> gives each worker its own copy of such libraries.
+>
+> **Limits:** one extension copy loaded by several interpreters can't tell which
+> interpreter a foreign thread belongs to, so that case fails loudly instead of guessing.
+> CI (`.github/workflows/subinterp.yml`) runs the unit tests, the sub-interpreter tests
+> and probes that check every fix against an upstream control.
+>
+> The rest of this README is upstream's.
+
 [Rust](https://www.rust-lang.org/) bindings for [Python](https://www.python.org/), including tools for creating native Python extension modules. Running and interacting with Python code from a Rust binary is also supported.
 
 - User Guide: [stable](https://pyo3.rs) | [main](https://pyo3.rs/main)
