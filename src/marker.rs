@@ -419,6 +419,31 @@ impl Python<'_> {
         f(guard.python())
     }
 
+    /// [`Python::attach`] for a thread whose thread state is already current, made so with
+    /// raw C calls (`PyEval_RestoreThread`) that PyO3 did not see: registers the attach in
+    /// PyO3's count, as `attach` does, but skips the checks and the `PyGILState_Ensure` /
+    /// `PyGILState_Release` pair that `attach` runs when the count is zero. A `Py<T>`
+    /// dropped in `f` is released at once, deferred references are drained on entry: the
+    /// same as under `attach`.
+    ///
+    /// For a server thread that keeps one sub-interpreter's thread state current across
+    /// many calls.
+    ///
+    /// # Safety
+    ///
+    /// A thread state is current on this thread (it holds that interpreter's GIL) and stays
+    /// current for the whole of `f`. Unlike [`Python::assume_attached`], the token is
+    /// bounded by the call.
+    #[inline]
+    pub unsafe fn attach_current<F, R>(f: F) -> R
+    where
+        F: for<'py> FnOnce(Python<'py>) -> R,
+    {
+        // SAFETY: the caller guarantees a thread state is current on this thread.
+        let guard = unsafe { AttachGuard::assume() };
+        f(guard.python())
+    }
+
     /// Variant of [`Python::attach`] which will return without attaching to the Python
     /// interpreter if the interpreter is in a state where it cannot be attached to:
     ///
