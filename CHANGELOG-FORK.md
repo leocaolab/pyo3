@@ -17,6 +17,30 @@ Changes in this fork relative to upstream PyO3. Upstream's own changes are in
 The goal is own-GIL sub-interpreters (PEP 684): one extension used by several
 interpreters in one process, each running under its own GIL.
 
+## `subinterp-2026-10-16.2`
+
+To use it:
+
+```toml
+[patch.crates-io]
+pyo3 = { git = "https://github.com/leocaolab/pyo3", tag = "subinterp-2026-10-16.2" }
+```
+
+Additive over `subinterp-2026-10-16.1`: no existing item changed.
+
+### Added
+
+- `InterpreterHandle::new_thread_state(self) -> Option<NonNull<ffi::PyThreadState>>`: a new
+  thread state for the handle's interpreter, made on the calling thread and not current
+  (`None` when `PyThreadState_New` returns null). On a thread with no thread state it becomes
+  the thread's own. The caller owns it and releases it by hand (the method's docs say how). For
+  code that runs thread states by hand (a thread-lifetime thread state, or a visit that has to
+  hold the interpreter's GIL for a raw call such as `PyThreadState_SetAsyncExc`) and so kept a
+  raw interpreter pointer next to the handle. Available on the limited API too. Ledger row #25.
+- Regression tests: `new_thread_state_belongs_to_the_handles_sub_interpreter` in
+  `tests/test_subinterp_identity.rs`, and `new_thread_state_becomes_the_threads_own` in
+  `sync::interpreter_handle`.
+
 ## `subinterp-2026-10-16.1`
 
 To use it:

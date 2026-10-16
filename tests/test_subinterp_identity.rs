@@ -1,5 +1,6 @@
-//! The interpreter identity methods of `InterpreterHandle` (`main`, `bound`, `is_main`, `id`) and
-//! `Python::attach_current`, in real own-GIL sub-interpreters.
+//! The interpreter identity methods of `InterpreterHandle` (`main`, `bound`, `is_main`, `id`),
+//! `InterpreterHandle::new_thread_state` and `Python::attach_current`, in real own-GIL
+//! sub-interpreters.
 //!
 //! The lib unit tests cover the main interpreter only. Whether a handle really names the
 //! sub-interpreter it came from, and not the main one, needs a sub-interpreter to tell them apart.
@@ -57,6 +58,47 @@ fn bound_names_the_sub_interpreter_inside_detach() {
             );
         });
     });
+}
+
+/// `new_thread_state` makes the thread state in the handle's sub-interpreter, not the main one: a
+/// thread with none that takes it is bound to the sub-interpreter, and runs in it once it makes
+/// the thread state current.
+#[test]
+fn new_thread_state_belongs_to_the_handles_sub_interpreter() {
+    let (sub, bound, ran_in) = in_sub_interpreter(|py| {
+        let handle = InterpreterHandle::current(py);
+        let sub = interp_id(py);
+        // Detached, so the visiting thread can take the sub-interpreter's GIL.
+        let (bound, ran_in) = py.detach(|| {
+            std::thread::spawn(move || {
+                let tstate = handle
+                    .new_thread_state()
+                    .expect("PyThreadState_New returned null");
+                let bound = InterpreterHandle::bound() == Some(handle);
+                // SAFETY: `tstate` was just made on this thread and is not current; made
+                // current, it is released the documented way.
+                unsafe {
+                    ffi::PyEval_RestoreThread(tstate.as_ptr());
+                    let ran_in = ffi::PyInterpreterState_GetID(ffi::PyInterpreterState_Get());
+                    ffi::PyThreadState_Clear(tstate.as_ptr());
+                    ffi::PyThreadState_DeleteCurrent();
+                    (bound, ran_in)
+                }
+            })
+            .join()
+            .unwrap()
+        });
+        (sub, bound, ran_in)
+    });
+    assert_ne!(sub, 0, "must run in a sub-interpreter");
+    assert!(
+        bound,
+        "the new thread state did not make its thread bound to the handle's interpreter"
+    );
+    assert_eq!(
+        ran_in, sub,
+        "the new thread state runs in interpreter {ran_in}, not {sub}"
+    );
 }
 
 /// `attach_current` runs `f` on the thread state that is already current (made so with raw calls

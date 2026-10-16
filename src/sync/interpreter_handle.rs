@@ -45,6 +45,7 @@
 use crate::ffi;
 use crate::internal::state::AssumeAttached;
 use crate::Python;
+use core::ptr::NonNull;
 
 /// The interpreter a value belongs to, so a foreign thread can attach back to it.
 ///
@@ -114,6 +115,30 @@ impl InterpreterHandle {
         // SAFETY: the handle's interpreter is alive (see "Safety of the handle" below), and
         // `PyInterpreterState_GetID` only reads it.
         unsafe { ffi::PyInterpreterState_GetID(self.0) }
+    }
+
+    /// A new thread state for this interpreter, made on the calling thread and not current, or
+    /// `None` when CPython could not make one (`PyThreadState_New` returned null: out of memory).
+    ///
+    /// For code that runs this interpreter's thread states by hand: a thread that keeps one
+    /// thread state for its whole life, or a visit from another thread that has to hold this
+    /// interpreter's GIL for a raw CPython call (`PyThreadState_SetAsyncExc` only reaches the
+    /// threads of the interpreter that is current). Code that only wants to run Rust against
+    /// the interpreter uses [`attach`][Self::attach], which also frees the thread state.
+    ///
+    /// The thread state is bound to the calling thread; if the thread had no thread state, it
+    /// becomes the thread's own, so [`bound`][Self::bound] names this interpreter from then on
+    /// and `Python::attach` there re-attaches it. Needs no GIL. The caller owns it: it is made
+    /// current with `PyEval_RestoreThread`, and released, with it current, by
+    /// `PyThreadState_Clear`, then `PyEval_SaveThread` and `PyThreadState_Delete` (or
+    /// `PyThreadState_DeleteCurrent`). One never released stays in the interpreter's list of
+    /// threads until the interpreter ends.
+    ///
+    /// The handle's lifetime rule applies (see [`attach`][Self::attach]).
+    pub fn new_thread_state(self) -> Option<NonNull<ffi::PyThreadState>> {
+        // SAFETY: the handle's interpreter is alive (the handle's rule); `PyThreadState_New`
+        // needs no GIL.
+        NonNull::new(unsafe { ffi::PyThreadState_New(self.0) })
     }
 
     /// Runs `f` attached to this handle's interpreter, whichever thread calls it.
@@ -313,5 +338,39 @@ mod tests {
             assert_eq!(InterpreterHandle::bound(), Some(handle));
             py.detach(|| assert_eq!(InterpreterHandle::bound(), Some(handle)));
         });
+    }
+
+    /// On a thread that has none, the new thread state becomes the thread's own, for the
+    /// handle's interpreter, and it runs there once made current.
+    #[test]
+    fn new_thread_state_becomes_the_threads_own() {
+        let handle = Python::attach(InterpreterHandle::current);
+        let (bound, ran_in) = std::thread::spawn(move || {
+            assert_eq!(InterpreterHandle::bound(), None);
+            let tstate = handle
+                .new_thread_state()
+                .expect("PyThreadState_New returned null");
+            let bound = InterpreterHandle::bound();
+            // SAFETY: `tstate` was just made on this thread and is not current; made current, it
+            // is released the documented way (Clear with it current, then Save and Delete).
+            let ran_in = unsafe {
+                ffi::PyEval_RestoreThread(tstate.as_ptr());
+                let ran_in = InterpreterHandle(ffi::PyInterpreterState_Get());
+                ffi::PyThreadState_Clear(tstate.as_ptr());
+                let detached = ffi::PyEval_SaveThread();
+                assert_eq!(detached, tstate.as_ptr());
+                ffi::PyThreadState_Delete(detached);
+                ran_in
+            };
+            (bound, ran_in)
+        })
+        .join()
+        .unwrap();
+        assert_eq!(
+            bound,
+            Some(handle),
+            "the thread state is not the thread's own"
+        );
+        assert_eq!(ran_in, handle, "the thread state is in another interpreter");
     }
 }
