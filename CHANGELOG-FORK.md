@@ -17,6 +17,32 @@ Changes in this fork relative to upstream PyO3. Upstream's own changes are in
 The goal is own-GIL sub-interpreters (PEP 684): one extension used by several
 interpreters in one process, each running under its own GIL.
 
+## `subinterp-2026-10-16.5`
+
+To use it:
+
+```toml
+[patch.crates-io]
+pyo3 = { git = "https://github.com/leocaolab/pyo3", tag = "subinterp-2026-10-16.5" }
+```
+
+A fix over `subinterp-2026-10-16.4`; no signature changed. One panic is gone.
+
+### Changed
+
+- `InterpreterHandle::try_attach` and `attach` no longer panic on a thread that is bound to a
+  different interpreter but detached from it (inside `py.detach` there). They visit with a
+  temporary thread state, as on a thread with none, and when the visit ends (also while a panic
+  in `f` unwinds) bind the thread to its own thread state again: CPython binds the thread to
+  whichever thread state was attached last, and deleting the temporary one leaves it bound to
+  none. Rebinding attaches the thread's own thread state for a moment, so it takes that
+  interpreter's GIL. Afterwards `bound`, `PyGILState_GetThisThreadState` and `PyGILState_Check`
+  answer as before. A thread *attached* to a different interpreter still panics. Ledger row #28.
+- Regression tests in `tests/test_subinterp_identity.rs`:
+  `try_attach_from_a_thread_bound_to_another_interpreter_keeps_its_binding`,
+  `a_panic_in_try_attach_from_a_thread_bound_to_another_interpreter_keeps_its_binding`,
+  `try_attach_while_attached_to_another_interpreter_panics`.
+
 ## `subinterp-2026-10-16.4`
 
 To use it:

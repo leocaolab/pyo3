@@ -147,16 +147,27 @@ impl InterpreterHandle {
     /// state for this interpreter exists but is detached (inside `py.detach`, or a worker between
     /// requests), that thread state is restored for `f` and detached again afterwards. On a thread
     /// with no thread state, a fresh one is created for this interpreter, used, and destroyed.
-    /// Both happen when `f` panics too, while the panic unwinds: the thread is left as it was
-    /// found, detached.
+    ///
+    /// On a thread bound to a *different* interpreter but detached from it (inside `py.detach`
+    /// there), a fresh one is created for this interpreter, used and destroyed too, and the
+    /// thread's own thread state is then made its bound one again. CPython makes whichever thread
+    /// state was attached last the thread's bound one (its `PyGILState` thread state), and
+    /// destroying the fresh one leaves the thread bound to none; so the visit ends by attaching to
+    /// the thread's own interpreter for a moment and detaching again, which takes that
+    /// interpreter's GIL. Afterwards [`bound`][Self::bound], `PyGILState_GetThisThreadState` and
+    /// `PyGILState_Check` answer as before the visit. Do not call it so while holding a lock that
+    /// a thread of the thread's own interpreter may wait on with that GIL held.
+    ///
+    /// All of this happens when `f` panics too, while the panic unwinds: the thread is left as it
+    /// was found, detached.
     ///
     /// # Panics
     ///
-    /// Panics if the thread is attached, or bound, to a *different* interpreter. Attaching to two
+    /// Panics if the thread is *attached* to a different interpreter. Attaching to two
     /// interpreters at once is not a thing CPython supports, and doing it silently is how the
     /// class of bug this type exists for gets written in the first place.
     ///
-    /// Panics too if the thread has no thread state and CPython cannot make one
+    /// Panics too if the thread needs a fresh thread state and CPython cannot make one
     /// (`PyThreadState_New` returned null: out of memory); [`try_attach`][Self::try_attach]
     /// returns `None` instead.
     ///
@@ -179,16 +190,16 @@ impl InterpreterHandle {
     /// [`attach`][Self::attach], or `None` when CPython cannot make the thread state it needs
     /// (`PyThreadState_New` returned null: out of memory); `f` has not run then.
     ///
-    /// Only a thread with no thread state needs a new one, so only there can this fail: on a
-    /// thread already attached to, or bound to, this interpreter it always runs `f`. For code
-    /// that must not panic when the runtime is out of memory, such as a visit from another
-    /// thread that holds the interpreter's GIL to call `PyThreadState_SetAsyncExc` into one of
-    /// its threads.
+    /// Only a thread not in this interpreter (no thread state, or one bound to another
+    /// interpreter and detached) needs a new one, so only there can this fail: on a thread
+    /// already attached to, or bound to, this interpreter it always runs `f`. For code that must
+    /// not panic when the runtime is out of memory, such as a visit from another thread that
+    /// holds the interpreter's GIL to call `PyThreadState_SetAsyncExc` into one of its threads.
     ///
     /// # Panics
     ///
-    /// As [`attach`][Self::attach]: if the thread is attached, or bound, to a *different*
-    /// interpreter. Those are mistakes in the caller, not conditions of the runtime.
+    /// As [`attach`][Self::attach]: if the thread is attached to a *different* interpreter.
+    /// That is a mistake in the caller, not a condition of the runtime.
     ///
     /// The handle's lifetime rule applies (see [`attach`][Self::attach]).
     pub fn try_attach<F, R>(self, f: F) -> Option<R>
@@ -229,23 +240,25 @@ impl InterpreterHandle {
             // SAFETY: as above.
             return Some(f(unsafe { Python::assume_attached() }));
         }
-        assert!(
-            bound.is_null(),
-            "this thread's thread state belongs to a different interpreter; attach to that one, \
-             or use a thread that has none"
-        );
+        // No thread state of this interpreter on this thread. Either none at all, or the thread
+        // is bound to another interpreter and detached from it: then that thread state is the
+        // one to bind the thread to again when the visit ends (see `VisitThreadState::Temporary`).
+        // SAFETY: always safe to call; null when this thread has no thread state.
+        let displaced = NonNull::new(unsafe { ffi::PyGILState_GetThisThreadState() });
 
         // SAFETY: the caller guarantees the interpreter is alive. `PyThreadState_New` does not
-        // require holding a GIL.
+        // require holding a GIL. It binds the new thread state to the thread only when the
+        // thread has none bound.
         let tstate = unsafe { ffi::PyThreadState_New(self.0) };
         if tstate.is_null() {
             return None;
         }
 
         // SAFETY: `tstate` was just created for this interpreter and is not current anywhere.
+        // Attaching it makes it the thread's bound thread state, displacing any other.
         unsafe { ffi::PyEval_RestoreThread(tstate) };
         // Declared before `_attached`, so it is dropped after it.
-        let _visit = VisitThreadState::Temporary(tstate);
+        let _visit = VisitThreadState::Temporary { tstate, displaced };
         // SAFETY: `tstate` is now current.
         let _attached = unsafe { AssumeAttached::new() };
         // SAFETY: as above.
@@ -260,9 +273,16 @@ impl InterpreterHandle {
 enum VisitThreadState {
     /// The thread's own thread state for the interpreter, found detached: detached again.
     Own(*mut ffi::PyThreadState),
-    /// One made for this visit, on a thread that had none: cleared, detached and deleted, so
-    /// the thread is left with none.
-    Temporary(*mut ffi::PyThreadState),
+    /// One made for this visit, on a thread with no thread state of the interpreter: cleared,
+    /// detached and deleted.
+    Temporary {
+        tstate: *mut ffi::PyThreadState,
+        /// The thread's own thread state of another interpreter, detached, that was the
+        /// thread's bound (`PyGILState`) thread state before `tstate` displaced it; `None` when
+        /// the thread had none. Bound again after `tstate` is deleted, so the thread is left
+        /// bound as it was found.
+        displaced: Option<NonNull<ffi::PyThreadState>>,
+    },
 }
 
 impl Drop for VisitThreadState {
@@ -274,7 +294,7 @@ impl Drop for VisitThreadState {
                 let detached = unsafe { ffi::PyEval_SaveThread() };
                 debug_assert_eq!(detached, tstate);
             }
-            VisitThreadState::Temporary(tstate) => {
+            VisitThreadState::Temporary { tstate, displaced } => {
                 // Order matters and there is only one right one:
                 //   Clear   — requires the GIL held and `tstate` current
                 //   Save    — detaches it and releases the GIL, returning it
@@ -287,6 +307,21 @@ impl Drop for VisitThreadState {
                     let detached = ffi::PyEval_SaveThread();
                     debug_assert_eq!(detached, tstate);
                     ffi::PyThreadState_Delete(tstate);
+                }
+                if let Some(own) = displaced {
+                    // Attaching `tstate` made it the thread's bound thread state (CPython's
+                    // `tstate_activate` binds whichever thread state it attaches), and deleting
+                    // it unbound it: the thread is bound to none now. The only way back to
+                    // binding `own` is attaching it, which binds it the same way; detached again
+                    // at once, the thread is as it was found.
+                    // SAFETY: `own` is this thread's own thread state, of an interpreter that
+                    // lives while the thread is bound to it, and is detached (nothing is
+                    // current: `tstate` was just saved).
+                    unsafe {
+                        ffi::PyEval_RestoreThread(own.as_ptr());
+                        let detached = ffi::PyEval_SaveThread();
+                        debug_assert_eq!(detached, own.as_ptr());
+                    }
                 }
             }
         }
