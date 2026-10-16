@@ -43,6 +43,13 @@ A fix over `subinterp-2026-10-16.4`; no signature changed. One panic is gone.
   `a_panic_in_try_attach_from_a_thread_bound_to_another_interpreter_keeps_its_binding`,
   `try_attach_while_attached_to_another_interpreter_panics`.
 
+### Fixed (tests only)
+
+- The lib unit tests no longer fail to compile on the limited API (`cargo test --lib
+  --features abi3-py310`): the three in `sync::interpreter_handle` that call `PyGILState_Check`,
+  which pyo3-ffi has only off the limited API, are compiled only there. CI builds abi3 with
+  `cargo check`, which does not compile tests, so it did not see this.
+
 ## `subinterp-2026-10-16.4`
 
 To use it:

@@ -364,6 +364,8 @@ mod tests {
     /// `py.detach`, or a worker that saved its thread state between requests — must get the GIL
     /// back for `f`. The fast path used to fire on the thread's bound thread state alone and ran
     /// `f` without the GIL (SUBINTERP-FIXES.md ledger #22).
+    // `PyGILState_Check` is not on the limited API (pyo3-ffi has it under `cpython`).
+    #[cfg(not(Py_LIMITED_API))]
     #[test]
     fn attach_inside_detach_holds_the_gil() {
         Python::attach(|py| {
@@ -449,6 +451,8 @@ mod tests {
 
     /// A panic in `f` on a thread with no thread state still frees the thread state `try_attach`
     /// made, and leaves the thread detached (SUBINTERP-FIXES.md ledger #27).
+    // `PyGILState_Check` is not on the limited API (pyo3-ffi has it under `cpython`).
+    #[cfg(not(Py_LIMITED_API))]
     #[test]
     fn a_panic_in_try_attach_on_a_foreign_thread_leaves_no_thread_state() {
         let handle = Python::attach(InterpreterHandle::current);
@@ -484,6 +488,8 @@ mod tests {
 
     /// A panic in `f` on a thread whose own thread state is detached hands that thread state back
     /// detached (SUBINTERP-FIXES.md ledger #27).
+    // `PyGILState_Check` is not on the limited API (pyo3-ffi has it under `cpython`).
+    #[cfg(not(Py_LIMITED_API))]
     #[test]
     fn a_panic_in_try_attach_detaches_the_threads_own_thread_state() {
         let handle = Python::attach(InterpreterHandle::current);
