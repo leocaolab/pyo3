@@ -120,11 +120,11 @@ impl InterpreterHandle {
     /// A new thread state for this interpreter, made on the calling thread and not current, or
     /// `None` when CPython could not make one (`PyThreadState_New` returned null: out of memory).
     ///
-    /// For code that runs this interpreter's thread states by hand: a thread that keeps one
-    /// thread state for its whole life, or a visit from another thread that has to hold this
-    /// interpreter's GIL for a raw CPython call (`PyThreadState_SetAsyncExc` only reaches the
-    /// threads of the interpreter that is current). Code that only wants to run Rust against
-    /// the interpreter uses [`attach`][Self::attach], which also frees the thread state.
+    /// For code that runs one of this interpreter's thread states by hand: a thread that keeps
+    /// one thread state for its whole life. A visit from another thread, including one that
+    /// holds this interpreter's GIL only for a raw CPython call, uses [`attach`][Self::attach]
+    /// (or [`try_attach`][Self::try_attach], which does not panic when no thread state can be
+    /// made), which also frees the thread state.
     ///
     /// The thread state is bound to the calling thread; if the thread had no thread state, it
     /// becomes the thread's own, so [`bound`][Self::bound] names this interpreter from then on
@@ -154,6 +154,10 @@ impl InterpreterHandle {
     /// interpreters at once is not a thing CPython supports, and doing it silently is how the
     /// class of bug this type exists for gets written in the first place.
     ///
+    /// Panics too if the thread has no thread state and CPython cannot make one
+    /// (`PyThreadState_New` returned null: out of memory); [`try_attach`][Self::try_attach]
+    /// returns `None` instead.
+    ///
     /// # Safety of the handle
     ///
     /// The interpreter must still be alive. Holding a `Py<T>` that belongs to it is enough: the
@@ -164,6 +168,28 @@ impl InterpreterHandle {
     /// [`is_main`][Self::is_main] and [`id`][Self::id], which read the interpreter. [`main`][Self::main]
     /// is no exception: it names the main interpreter, which is alive only until Python finalizes.
     pub fn attach<F, R>(self, f: F) -> R
+    where
+        F: for<'py> FnOnce(Python<'py>) -> R,
+    {
+        self.try_attach(f).expect("PyThreadState_New returned null")
+    }
+
+    /// [`attach`][Self::attach], or `None` when CPython cannot make the thread state it needs
+    /// (`PyThreadState_New` returned null: out of memory); `f` has not run then.
+    ///
+    /// Only a thread with no thread state needs a new one, so only there can this fail: on a
+    /// thread already attached to, or bound to, this interpreter it always runs `f`. For code
+    /// that must not panic when the runtime is out of memory, such as a visit from another
+    /// thread that holds the interpreter's GIL to call `PyThreadState_SetAsyncExc` into one of
+    /// its threads.
+    ///
+    /// # Panics
+    ///
+    /// As [`attach`][Self::attach]: if the thread is attached, or bound, to a *different*
+    /// interpreter. Those are mistakes in the caller, not conditions of the runtime.
+    ///
+    /// The handle's lifetime rule applies (see [`attach`][Self::attach]).
+    pub fn try_attach<F, R>(self, f: F) -> Option<R>
     where
         F: for<'py> FnOnce(Python<'py>) -> R,
     {
@@ -181,7 +207,7 @@ impl InterpreterHandle {
             // SAFETY: a thread state for this interpreter is current.
             let _attached = unsafe { AssumeAttached::new() };
             // SAFETY: as above.
-            return f(unsafe { Python::assume_attached() });
+            return Some(f(unsafe { Python::assume_attached() }));
         }
 
         // Not attached. A thread that is *bound* to this interpreter but detached (inside
@@ -203,7 +229,7 @@ impl InterpreterHandle {
             // SAFETY: `tstate` is current; hand it back detached, as it was found.
             let detached = unsafe { ffi::PyEval_SaveThread() };
             debug_assert_eq!(detached, tstate);
-            return result;
+            return Some(result);
         }
         assert!(
             bound.is_null(),
@@ -214,7 +240,9 @@ impl InterpreterHandle {
         // SAFETY: the caller guarantees the interpreter is alive. `PyThreadState_New` does not
         // require holding a GIL.
         let tstate = unsafe { ffi::PyThreadState_New(self.0) };
-        assert!(!tstate.is_null(), "PyThreadState_New returned null");
+        if tstate.is_null() {
+            return None;
+        }
 
         // SAFETY: `tstate` was just created for this interpreter and is not current anywhere.
         unsafe { ffi::PyEval_RestoreThread(tstate) };
@@ -239,7 +267,7 @@ impl InterpreterHandle {
             debug_assert_eq!(detached, tstate);
             ffi::PyThreadState_Delete(tstate);
         }
-        result
+        Some(result)
     }
 }
 
@@ -338,6 +366,28 @@ mod tests {
             assert_eq!(InterpreterHandle::bound(), Some(handle));
             py.detach(|| assert_eq!(InterpreterHandle::bound(), Some(handle)));
         });
+    }
+
+    /// `try_attach` from a thread with no thread state runs `f`, and frees the thread state it
+    /// made: the thread is left with none.
+    #[test]
+    fn try_attach_on_a_foreign_thread_runs_and_leaves_no_thread_state() {
+        let (handle, obj): (InterpreterHandle, Py<PyAny>) = Python::attach(|py| {
+            (
+                InterpreterHandle::current(py),
+                py.eval(c"'from the owning interpreter'", None, None)
+                    .unwrap()
+                    .unbind(),
+            )
+        });
+        let (got, bound_after) = std::thread::spawn(move || {
+            let got = handle.try_attach(|py| obj.bind(py).extract::<String>().unwrap());
+            (got, InterpreterHandle::bound())
+        })
+        .join()
+        .unwrap();
+        assert_eq!(got.as_deref(), Some("from the owning interpreter"));
+        assert_eq!(bound_after, None, "try_attach left its thread state behind");
     }
 
     /// On a thread that has none, the new thread state becomes the thread's own, for the

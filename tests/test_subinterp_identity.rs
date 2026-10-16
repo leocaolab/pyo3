@@ -1,5 +1,6 @@
 //! The interpreter identity methods of `InterpreterHandle` (`main`, `bound`, `is_main`, `id`),
-//! `InterpreterHandle::new_thread_state` and `Python::attach_current`, in real own-GIL
+//! `InterpreterHandle::new_thread_state`, `InterpreterHandle::try_attach` and
+//! `Python::attach_current`, in real own-GIL
 //! sub-interpreters.
 //!
 //! The lib unit tests cover the main interpreter only. Whether a handle really names the
@@ -98,6 +99,41 @@ fn new_thread_state_belongs_to_the_handles_sub_interpreter() {
     assert_eq!(
         ran_in, sub,
         "the new thread state runs in interpreter {ran_in}, not {sub}"
+    );
+}
+
+/// `try_attach` from a thread with no thread state runs `f` in the handle's sub-interpreter, not
+/// the main one, with a thread state current, and frees that thread state afterwards.
+#[test]
+fn try_attach_runs_in_the_handles_sub_interpreter() {
+    let (sub, got, bound_after) = in_sub_interpreter(|py| {
+        let handle = InterpreterHandle::current(py);
+        let sub = interp_id(py);
+        // Detached, so the visiting thread can take the sub-interpreter's GIL.
+        let (got, bound_after) = py.detach(|| {
+            std::thread::spawn(move || {
+                let got = handle.try_attach(|py2| {
+                    // SAFETY: always safe to call; null when no thread state is current.
+                    let current = !unsafe { ffi::PyThreadState_GetUnchecked() }.is_null();
+                    (interp_id(py2), current)
+                });
+                (got, InterpreterHandle::bound())
+            })
+            .join()
+            .unwrap()
+        });
+        (sub, got, bound_after)
+    });
+    assert_ne!(sub, 0, "must run in a sub-interpreter");
+    let (ran_in, current) = got.expect("try_attach could not make a thread state");
+    assert_eq!(
+        ran_in, sub,
+        "try_attach ran in interpreter {ran_in}, not {sub}"
+    );
+    assert!(current, "try_attach ran f with no thread state current");
+    assert_eq!(
+        bound_after, None,
+        "try_attach left its thread state on the visiting thread"
     );
 }
 

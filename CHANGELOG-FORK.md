@@ -17,6 +17,30 @@ Changes in this fork relative to upstream PyO3. Upstream's own changes are in
 The goal is own-GIL sub-interpreters (PEP 684): one extension used by several
 interpreters in one process, each running under its own GIL.
 
+## `subinterp-2026-10-16.3`
+
+To use it:
+
+```toml
+[patch.crates-io]
+pyo3 = { git = "https://github.com/leocaolab/pyo3", tag = "subinterp-2026-10-16.3" }
+```
+
+Additive over `subinterp-2026-10-16.2`: no existing item changed. `InterpreterHandle::attach`
+now runs through `try_attach`; its behaviour and its panic messages are the same.
+
+### Added
+
+- `InterpreterHandle::try_attach(self, f) -> Option<R>`: `attach`, or `None` when the thread has
+  no thread state and CPython cannot make one (`PyThreadState_New` returned null: out of
+  memory); `f` has not run then. The panics for a thread attached or bound to a different
+  interpreter are unchanged. For code that visits an interpreter from another thread and must
+  not panic when the runtime is out of memory, which so far wrote that visit by hand over
+  `new_thread_state`. Available on the limited API too. Ledger row #26.
+- Regression tests: `try_attach_runs_in_the_handles_sub_interpreter` in
+  `tests/test_subinterp_identity.rs`, and `try_attach_on_a_foreign_thread_runs_and_leaves_no_thread_state`
+  in `sync::interpreter_handle`.
+
 ## `subinterp-2026-10-16.2`
 
 To use it:
