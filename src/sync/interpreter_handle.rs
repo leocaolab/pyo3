@@ -67,6 +67,55 @@ impl InterpreterHandle {
         InterpreterHandle(unsafe { ffi::PyInterpreterState_Get() })
     }
 
+    /// The main interpreter. Needs no token and no attach, but Python must be initialized
+    /// (see [`Python::initialize`]) and not yet finalized, as for any other handle.
+    ///
+    /// Not on the limited API: `PyInterpreterState_Main` is only in the full API.
+    #[cfg(not(Py_LIMITED_API))]
+    pub fn main() -> Self {
+        // SAFETY: `PyInterpreterState_Main` only reads the runtime's main-interpreter slot, which
+        // is set once Python is initialized; the caller's precondition is that it is.
+        InterpreterHandle(unsafe { ffi::PyInterpreterState_Main() })
+    }
+
+    /// The interpreter that the calling thread's own thread state belongs to, or `None` if this
+    /// thread has no thread state.
+    ///
+    /// Unlike [`current`][Self::current] this does not require the thread to be attached: a
+    /// thread bound to an interpreter but detached from it (inside `py.detach`, or a worker
+    /// between requests) still answers. It is the same binding [`attach`][Self::attach] reads.
+    pub fn bound() -> Option<Self> {
+        // SAFETY: always safe to call; null when this thread has no thread state.
+        let tstate = unsafe { ffi::PyGILState_GetThisThreadState() };
+        if tstate.is_null() {
+            return None;
+        }
+        // SAFETY: `tstate` is this thread's own thread state, which keeps its interpreter alive.
+        Some(InterpreterHandle(unsafe {
+            ffi::PyThreadState_GetInterpreter(tstate)
+        }))
+    }
+
+    /// Whether this is the main interpreter.
+    ///
+    /// Not on the limited API, for the same reason as [`main`][Self::main].
+    #[cfg(not(Py_LIMITED_API))]
+    pub fn is_main(self) -> bool {
+        // SAFETY: `PyInterpreterState_Main` has no preconditions once the runtime is initialized.
+        self.0 == unsafe { ffi::PyInterpreterState_Main() }
+    }
+
+    /// The interpreter's id, as CPython numbers them: the main interpreter is `0`, and each
+    /// sub-interpreter gets the next free number.
+    ///
+    /// Meant for naming an interpreter in errors and logs, and for comparing two of them. Two
+    /// handles to the same interpreter always give the same id.
+    pub fn id(self) -> i64 {
+        // SAFETY: the handle's interpreter is alive (see "Safety of the handle" below), and
+        // `PyInterpreterState_GetID` only reads it.
+        unsafe { ffi::PyInterpreterState_GetID(self.0) }
+    }
+
     /// Runs `f` attached to this handle's interpreter, whichever thread calls it.
     ///
     /// If the calling thread is attached to this same interpreter, `f` runs directly. If its thread
@@ -85,8 +134,10 @@ impl InterpreterHandle {
     /// The interpreter must still be alive. Holding a `Py<T>` that belongs to it is enough: the
     /// object cannot outlive its interpreter, so if you have one the interpreter is there. A
     /// handle kept past the interpreter's destruction is a dangling pointer and calling `attach`
-    /// on it is undefined behaviour — which is why `current` takes a `Python<'_>` and there is no
-    /// constructor from a raw pointer.
+    /// on it is undefined behaviour — which is why `current` and `bound` take their interpreter
+    /// from the thread and there is no constructor from a raw pointer. The same holds for
+    /// [`is_main`][Self::is_main] and [`id`][Self::id], which read the interpreter. [`main`][Self::main]
+    /// is no exception: it names the main interpreter, which is alive only until Python finalizes.
     pub fn attach<F, R>(self, f: F) -> R
     where
         F: for<'py> FnOnce(Python<'py>) -> R,
@@ -230,6 +281,37 @@ mod tests {
                 7
             });
             assert_eq!(n, 7);
+        });
+    }
+
+    /// The main interpreter is the one the test process runs in, and it is interpreter 0.
+    #[cfg(not(Py_LIMITED_API))]
+    #[test]
+    fn main_is_the_main_interpreter() {
+        Python::attach(|py| {
+            let main = InterpreterHandle::main();
+            assert!(main.is_main());
+            assert_eq!(main.id(), 0);
+            assert_eq!(main, InterpreterHandle::current(py));
+            assert_eq!(InterpreterHandle::current(py).id(), 0);
+        });
+    }
+
+    /// A thread with no thread state has no interpreter to be bound to.
+    #[test]
+    fn bound_is_none_on_a_thread_without_a_thread_state() {
+        std::thread::spawn(|| assert_eq!(InterpreterHandle::bound(), None))
+            .join()
+            .unwrap();
+    }
+
+    /// `bound` answers for a thread that is detached, where `current` cannot.
+    #[test]
+    fn bound_survives_detaching() {
+        Python::attach(|py| {
+            let handle = InterpreterHandle::current(py);
+            assert_eq!(InterpreterHandle::bound(), Some(handle));
+            py.detach(|| assert_eq!(InterpreterHandle::bound(), Some(handle)));
         });
     }
 }

@@ -17,6 +17,35 @@ Changes in this fork relative to upstream PyO3. Upstream's own changes are in
 The goal is own-GIL sub-interpreters (PEP 684): one extension used by several
 interpreters in one process, each running under its own GIL.
 
+## `subinterp-2026-10-16.1`
+
+To use it:
+
+```toml
+[patch.crates-io]
+pyo3 = { git = "https://github.com/leocaolab/pyo3", tag = "subinterp-2026-10-16.1" }
+```
+
+Additive over `subinterp-2026-10-14.1`: no existing item changed.
+
+### Added
+
+- `InterpreterHandle::main()`: the main interpreter's handle, with no token needed.
+- `InterpreterHandle::bound()`: the interpreter the calling thread's own thread state belongs
+  to, or `None`. Unlike `current`, it also answers on a thread that is detached.
+- `InterpreterHandle::is_main(self)` and `InterpreterHandle::id(self) -> i64` (the interpreter
+  number, main is `0`). Both read the interpreter, so the handle's lifetime rule applies.
+  `main()` is the one exception: it names the main interpreter, valid while Python runs.
+- Regression tests: `tests/test_subinterp_identity.rs` (a new process per the sub-interpreter
+  rule), and unit tests for the four methods in `sync::interpreter_handle`.
+
+### Backfilled from `subinterp-2026-10-14.1`
+
+- `Python::attach_current` (`unsafe`) was on the `subinterp-2026-10-14.1` tag but had no test,
+  no changelog entry and no ledger row, and the tag was not on the branch. It is on the branch
+  now, with a regression test (`attach_current_*` in `tests/test_subinterp_identity.rs`) and
+  ledger row #24.
+
 ## `subinterp-2026-09-23.2`
 
 Use it with `tag = "subinterp-2026-09-23.2"` in the `[patch.crates-io]` entries (same form as below).
