@@ -147,6 +147,8 @@ impl InterpreterHandle {
     /// state for this interpreter exists but is detached (inside `py.detach`, or a worker between
     /// requests), that thread state is restored for `f` and detached again afterwards. On a thread
     /// with no thread state, a fresh one is created for this interpreter, used, and destroyed.
+    /// Both happen when `f` panics too, while the panic unwinds: the thread is left as it was
+    /// found, detached.
     ///
     /// # Panics
     ///
@@ -220,16 +222,12 @@ impl InterpreterHandle {
             let tstate = unsafe { ffi::PyGILState_GetThisThreadState() };
             // SAFETY: as above.
             unsafe { ffi::PyEval_RestoreThread(tstate) };
-            let result = {
-                // SAFETY: `tstate` is now current.
-                let _attached = unsafe { AssumeAttached::new() };
-                // SAFETY: as above.
-                f(unsafe { Python::assume_attached() })
-            };
-            // SAFETY: `tstate` is current; hand it back detached, as it was found.
-            let detached = unsafe { ffi::PyEval_SaveThread() };
-            debug_assert_eq!(detached, tstate);
-            return Some(result);
+            // Declared before `_attached`, so it is dropped after it.
+            let _visit = VisitThreadState::Own(tstate);
+            // SAFETY: `tstate` is now current.
+            let _attached = unsafe { AssumeAttached::new() };
+            // SAFETY: as above.
+            return Some(f(unsafe { Python::assume_attached() }));
         }
         assert!(
             bound.is_null(),
@@ -246,28 +244,52 @@ impl InterpreterHandle {
 
         // SAFETY: `tstate` was just created for this interpreter and is not current anywhere.
         unsafe { ffi::PyEval_RestoreThread(tstate) };
+        // Declared before `_attached`, so it is dropped after it.
+        let _visit = VisitThreadState::Temporary(tstate);
+        // SAFETY: `tstate` is now current.
+        let _attached = unsafe { AssumeAttached::new() };
+        // SAFETY: as above.
+        Some(f(unsafe { Python::assume_attached() }))
+    }
+}
 
-        let result = {
-            // SAFETY: `tstate` is now current.
-            let _attached = unsafe { AssumeAttached::new() };
-            // SAFETY: as above.
-            f(unsafe { Python::assume_attached() })
-        };
+/// The thread state a visit by [`InterpreterHandle::try_attach`] made current, given back when
+/// the visit ends: when `f` returns, and also while a panic in `f` unwinds. Without it such a
+/// panic left the thread attached, holding the interpreter's GIL, and a thread state made for
+/// the visit stayed in the interpreter's list of threads.
+enum VisitThreadState {
+    /// The thread's own thread state for the interpreter, found detached: detached again.
+    Own(*mut ffi::PyThreadState),
+    /// One made for this visit, on a thread that had none: cleared, detached and deleted, so
+    /// the thread is left with none.
+    Temporary(*mut ffi::PyThreadState),
+}
 
-        // Order matters and there is only one right one:
-        //   Clear   — requires the GIL held and `tstate` current
-        //   Save    — detaches it and releases the GIL, returning it
-        //   Delete  — requires it to no longer be current
-        // Slipping a `PyThreadState_Swap(NULL)` in before `Save` leaves nothing for `Save` to
-        // detach, and CPython segfaults.
-        // SAFETY: `tstate` is current and this thread holds its interpreter's GIL.
-        unsafe {
-            ffi::PyThreadState_Clear(tstate);
-            let detached = ffi::PyEval_SaveThread();
-            debug_assert_eq!(detached, tstate);
-            ffi::PyThreadState_Delete(tstate);
+impl Drop for VisitThreadState {
+    fn drop(&mut self) {
+        match *self {
+            VisitThreadState::Own(tstate) => {
+                // SAFETY: `tstate` is current (made so by `try_attach`, which `f` cannot undo
+                // without a raw call of its own); hand it back detached, as it was found.
+                let detached = unsafe { ffi::PyEval_SaveThread() };
+                debug_assert_eq!(detached, tstate);
+            }
+            VisitThreadState::Temporary(tstate) => {
+                // Order matters and there is only one right one:
+                //   Clear   — requires the GIL held and `tstate` current
+                //   Save    — detaches it and releases the GIL, returning it
+                //   Delete  — requires it to no longer be current
+                // Slipping a `PyThreadState_Swap(NULL)` in before `Save` leaves nothing for
+                // `Save` to detach, and CPython segfaults.
+                // SAFETY: `tstate` is current and this thread holds its interpreter's GIL.
+                unsafe {
+                    ffi::PyThreadState_Clear(tstate);
+                    let detached = ffi::PyEval_SaveThread();
+                    debug_assert_eq!(detached, tstate);
+                    ffi::PyThreadState_Delete(tstate);
+                }
+            }
         }
-        Some(result)
     }
 }
 
@@ -388,6 +410,81 @@ mod tests {
         .unwrap();
         assert_eq!(got.as_deref(), Some("from the owning interpreter"));
         assert_eq!(bound_after, None, "try_attach left its thread state behind");
+    }
+
+    /// A panic in `f` on a thread with no thread state still frees the thread state `try_attach`
+    /// made, and leaves the thread detached (SUBINTERP-FIXES.md ledger #27).
+    #[test]
+    fn a_panic_in_try_attach_on_a_foreign_thread_leaves_no_thread_state() {
+        let handle = Python::attach(InterpreterHandle::current);
+        let (panicked, attached_after, bound_after) = std::thread::spawn(move || {
+            let panicked = std::panic::catch_unwind(|| {
+                handle.try_attach(|_py| panic!("f panics inside the visit"))
+            })
+            .is_err();
+            // SAFETY: always safe to call; no sub-interpreter exists in this binary, so
+            // `PyGILState_Check` is live and reports whether this thread holds the GIL.
+            let attached_after = unsafe { ffi::PyGILState_Check() } == 1;
+            if attached_after {
+                // What the fix does, so a red run does not leave the GIL held by a dead thread.
+                // SAFETY: the visit's thread state is still current on this thread.
+                unsafe {
+                    let tstate = ffi::PyThreadState_Get();
+                    ffi::PyThreadState_Clear(tstate);
+                    ffi::PyEval_SaveThread();
+                    ffi::PyThreadState_Delete(tstate);
+                }
+            }
+            (panicked, attached_after, InterpreterHandle::bound())
+        })
+        .join()
+        .unwrap();
+        assert!(panicked);
+        assert!(!attached_after, "a panic in f left the thread attached");
+        assert_eq!(
+            bound_after, None,
+            "a panic in f left the visit's thread state behind"
+        );
+    }
+
+    /// A panic in `f` on a thread whose own thread state is detached hands that thread state back
+    /// detached (SUBINTERP-FIXES.md ledger #27).
+    #[test]
+    fn a_panic_in_try_attach_detaches_the_threads_own_thread_state() {
+        let handle = Python::attach(InterpreterHandle::current);
+        let (panicked, attached_after, bound_after) = std::thread::spawn(move || {
+            // The thread's own thread state, detached, as a worker's is between requests.
+            let own = handle
+                .new_thread_state()
+                .expect("PyThreadState_New returned null");
+            let panicked = std::panic::catch_unwind(|| {
+                handle.try_attach(|_py| panic!("f panics inside the visit"))
+            })
+            .is_err();
+            // SAFETY: as in the test above.
+            let attached_after = unsafe { ffi::PyGILState_Check() } == 1;
+            let bound_after = InterpreterHandle::bound();
+            // SAFETY: `own` is this thread's thread state; detached (made so here when a red run
+            // left it current), it is released the documented way.
+            unsafe {
+                if !attached_after {
+                    ffi::PyEval_RestoreThread(own.as_ptr());
+                }
+                ffi::PyThreadState_Clear(own.as_ptr());
+                ffi::PyEval_SaveThread();
+                ffi::PyThreadState_Delete(own.as_ptr());
+            }
+            (panicked, attached_after, bound_after)
+        })
+        .join()
+        .unwrap();
+        assert!(panicked);
+        assert!(!attached_after, "a panic in f left the thread attached");
+        assert_eq!(
+            bound_after,
+            Some(handle),
+            "the thread lost its own thread state"
+        );
     }
 
     /// On a thread that has none, the new thread state becomes the thread's own, for the

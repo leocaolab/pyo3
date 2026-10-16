@@ -1,7 +1,6 @@
 //! The interpreter identity methods of `InterpreterHandle` (`main`, `bound`, `is_main`, `id`),
-//! `InterpreterHandle::new_thread_state`, `InterpreterHandle::try_attach` and
-//! `Python::attach_current`, in real own-GIL
-//! sub-interpreters.
+//! `InterpreterHandle::new_thread_state`, `InterpreterHandle::try_attach` (also when its `f`
+//! panics) and `Python::attach_current`, in real own-GIL sub-interpreters.
 //!
 //! The lib unit tests cover the main interpreter only. Whether a handle really names the
 //! sub-interpreter it came from, and not the main one, needs a sub-interpreter to tell them apart.
@@ -135,6 +134,58 @@ fn try_attach_runs_in_the_handles_sub_interpreter() {
         bound_after, None,
         "try_attach left its thread state on the visiting thread"
     );
+}
+
+/// A panic in `try_attach`'s `f` on a thread with no thread state, in a sub-interpreter: the
+/// thread state made for the visit is freed and the thread is left detached, so the
+/// sub-interpreter's GIL is free again (ledger #27).
+#[test]
+fn a_panic_in_try_attach_frees_the_visits_thread_state() {
+    let (sub, panicked, attached_after, bound_after, reentered) = in_sub_interpreter(|py| {
+        let handle = InterpreterHandle::current(py);
+        let sub = interp_id(py);
+        let (panicked, attached_after, bound_after) = py.detach(|| {
+            std::thread::spawn(move || {
+                let panicked = std::panic::catch_unwind(|| {
+                    handle.try_attach(|_py| panic!("f panics inside the visit"))
+                })
+                .is_err();
+                // SAFETY: always safe to call; null when no thread state is current.
+                let current = unsafe { ffi::PyThreadState_GetUnchecked() };
+                if !current.is_null() {
+                    // What the fix does, so a red run does not leave the sub-interpreter's GIL
+                    // held by a thread that has ended.
+                    // SAFETY: the visit's thread state is current on this thread.
+                    unsafe {
+                        ffi::PyThreadState_Clear(current);
+                        ffi::PyEval_SaveThread();
+                        ffi::PyThreadState_Delete(current);
+                    }
+                }
+                (panicked, !current.is_null(), InterpreterHandle::bound())
+            })
+            .join()
+            .unwrap()
+        });
+        // The GIL is free again: a second visit from another thread runs.
+        let reentered = py.detach(|| {
+            std::thread::spawn(move || handle.try_attach(interp_id))
+                .join()
+                .unwrap()
+        });
+        (sub, panicked, attached_after, bound_after, reentered)
+    });
+    assert_ne!(sub, 0, "must run in a sub-interpreter");
+    assert!(panicked);
+    assert!(
+        !attached_after,
+        "a panic in f left the visiting thread attached"
+    );
+    assert_eq!(
+        bound_after, None,
+        "a panic in f left the visit's thread state on the visiting thread"
+    );
+    assert_eq!(reentered, Some(sub));
 }
 
 /// `attach_current` runs `f` on the thread state that is already current (made so with raw calls
