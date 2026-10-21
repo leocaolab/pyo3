@@ -69,7 +69,7 @@
 > applies to it: build polars from source on this fork
 > ([leocaolab/polars](https://github.com/leocaolab/polars), branch `subinterp`: upstream
 > polars plus the `[patch.crates-io]` pin, no polars code changes).
-> [Pyronova](https://github.com/leocaolab/pyronova) runs this fork in production and
+> [mipyre](https://github.com/leocaolab/mipyre) runs this fork in production and
 > gives each worker its own copy of such libraries.
 >
 > **Limits:** one extension copy loaded by several interpreters can't tell which
