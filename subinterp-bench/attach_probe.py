@@ -2,12 +2,12 @@
 
 For each build (upstream parent vs this branch) and each deployment:
   shared  — one .so loaded by every interpreter (a shared extension)
-  copies  — each interpreter loads its own copy of the .so (Pyronova isolate)
+  copies  — each interpreter loads its own copy of the .so (one copy per interpreter)
 and each thread origin:
   pythread — a `threading.Thread` of the main interpreter that runs the
              sub-interpreter (its gilstate slot is bound to MAIN)
   native   — a native thread whose FIRST thread state is the sub-interpreter's
-             (what Pyronova's workers are)
+             (what mipyre's workers are)
 it records which interpreter two calls land in:
   after_detach — `Python::attach` nested inside `py.detach` on the same thread
   new_thread   — `Python::attach` on a fresh OS thread

@@ -3,7 +3,7 @@
 > 实测记录 · Python 3.14.6 / macOS ARM64 (6 P-core + 12 E-core)
 > polars Python 1.43.2 / Rust crates 0.55.1 · PyO3 0.29 · `abi3-py310`
 > 对照 = 本分支的父提交 `dfdbc46`(PyO3 main),不是 crates.io 发行版
-> 相关:[`JOURNAL.md`](../JOURNAL.md) · [`METHOD.md`](METHOD.md)
+> 相关:[`METHOD.md`](METHOD.md)
 
 ## ⚠️ 先读这一段
 
@@ -229,32 +229,6 @@ worker × 20 万行,filter → group_by → agg
 ```
 
 **8 倍的活,1.25 倍的墙钟。**
-
-### SkyTrade 型策略负载
-
-表达式照抄 SkyTrade 代码里频次最高的那几个:
-`rolling_mean(20).over("sym")` / `rolling_std` / `shift(1).over` / `fill_null` /
-两级 filter / `group_by`-`agg`。
-
-固定每 worker 负载,加 worker:
-
-| worker | 行数 | 墙钟 | 吞吐 | 类型独立 | 常驻 |
-|---:|---:|---:|---:|:---:|---:|
-| 1 | 100,000 | 0.10s | 1.0 M行/秒 | 1/1 | +93 MB |
-| 8 | 800,000 | 0.12s | 6.9 M行/秒 | 8/8 | +389 MB |
-| 24 | 2,400,000 | 0.20s | 12.0 M行/秒 | 24/24 | +938 MB |
-
-固定 8 worker,加数据量:
-
-| 行数 | 墙钟 | 吞吐 | 常驻 |
-|---:|---:|---:|---:|
-| 3,200,000 | 0.23s | 14.0 M行/秒 | +752 MB |
-| 8,000,000 | 0.44s | 18.3 M行/秒 | +1,314 MB |
-| 16,000,000 | 0.88s | 18.1 M行/秒 | +1,715 MB |
-| 32,000,000 | 1.86s | 17.2 M行/秒 | +2,614 MB |
-
-吞吐在 **~18 M行/秒**封顶(内存带宽),从 3.2M 行到 32M 行只掉 8% —— 不随规模崩。
-24 worker 仍在涨,说明超过 6 个 P-core 之后 E-core 还在贡献。
 
 ---
 

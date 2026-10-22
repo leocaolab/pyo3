@@ -40,11 +40,11 @@
 > | Foreign threads (#13, #22) | `Python::attach` on a thread with no thread state (rayon, tokio) lands in the **main** interpreter | lands in the interpreter that executed this extension copy's module; fails loudly if that is ambiguous. `InterpreterHandle` attaches to an explicit interpreter from any thread |
 > | Teardown (#3, #5, #6, #20) | per-interpreter values are never reclaimed (2.6–3.7 MB per interpreter, unbounded) | released at `Py_EndInterpreter` |
 > | Declaration (#8–#11) | no `Py_MOD_PER_INTERPRETER_GIL_SUPPORTED`, so strict mode refuses the module (abi3 included) | declared by every `#[pymodule]`, abi3 included |
-> | Several extensions (#21) | — | each extension copy keeps its own registry, so two fork-built extensions share one process (e.g. pyronova + polars) |
+> | Several extensions (#21) | — | each extension copy keeps its own registry, so two fork-built extensions share one process (e.g. mipyre + polars) |
 >
 > **Scaling:** creating objects on 12 own-GIL workers scales 9.54× on a MacBook and 6.70×
 > on an 8-core Linux box; upstream scales 1.20× / 1.48×, because every interpreter shares
-> one type object and every core contends on its refcount ([`JOURNAL.md`](JOURNAL.md)).
+> one type object and every core contends on its refcount ([`subinterp-bench/README.md`](subinterp-bench/README.md#measured-results)).
 >
 > ### What it means for an application: polars
 >
@@ -56,7 +56,7 @@
 > |---|---|---|
 > | `import polars` in several interpreters | strict mode 0/4; with the override 1/4, the rest raise `ImportError` (#576, submodules) | 4/4 in strict mode, no process-wide switch (#7–#10) |
 > | Core API in a sub-interpreter: `DataFrame`/`Series`, `lazy().collect()`, streaming, `group_by().agg()`, `join`, `over`, `when/then`, `.str`/`.dt`, `pivot`, `rolling_*`, `read_csv/json/ndjson`, `scan_csv`, `write_parquet(BytesIO)` | can't get past the import | 21/22 worked when measured; the 22nd was `write_csv` to a file-like object, the thread-pool write path in the last row |
-> | Parallel work across interpreters | — | 8 interpreters × filter/`group_by`/`agg`: 8× the work in 1.25× the wall clock, each result checked exactly; a SkyTrade-style `rolling_*().over()` workload reaches ~18 M rows/s |
+> | Parallel work across interpreters | — | 8 interpreters × filter/`group_by`/`agg`: 8× the work in 1.25× the wall clock, each result checked exactly |
 > | Creating objects from several interpreters at once | SIGSEGV / SIGABRT (shared type refcount) | correct (#1) |
 > | Several interpreters importing polars at the same time | — | no deadlock (#16; it deadlocked with 4) |
 > | Tearing an interpreter down after parallel compute | — | clean, 10/10 (#15; segfaulted 3/3 with ≥2 interpreters) |

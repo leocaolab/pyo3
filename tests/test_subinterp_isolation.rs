@@ -448,7 +448,7 @@ fn neighbouring_cells_have_distinct_slots() {
 
 // ---------------------------------------------------------------------------------------------
 // Ledger #22: `InterpreterHandle::attach` on a thread whose thread state for that interpreter is
-// bound but detached. Pyronova's workers are exactly this: a worker thread bound to its own
+// bound but detached. mipyre's workers are exactly this: a worker thread bound to its own
 // sub-interpreter, detached between requests or inside `py.detach`. The fast path used to fire on
 // the binding alone and ran `f` with no thread state current, i.e. without the GIL.
 
