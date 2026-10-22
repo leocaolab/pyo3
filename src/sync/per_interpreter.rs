@@ -51,7 +51,7 @@ const HOOK_NAME: &CStr = c"_pyo3_per_interpreter_hook";
 /// too. With one fixed key, the second PyO3 extension loaded into an interpreter found the first
 /// one's registry and read its slots by its own indices: the first extension's type objects came
 /// back as the second's — measured as a segfault on importing two fork-built extensions
-/// (pyronova's engine, then polars) in one interpreter, main or sub, in either order. The same
+/// (mipyre's engine, then polars) in one interpreter, main or sub, in either order. The same
 /// fixed hook key meant only the first copy's teardown hook was ever registered, so the second
 /// copy's registry and deferred decrefs were never released at `Py_EndInterpreter`.
 ///

@@ -7,7 +7,7 @@ rayon worker threads (`PyFileLikeObject::write`, `Python::attach`). Before M1.3
 those attaches landed in the MAIN interpreter (POLARS.md). This check:
 
   copies — each interpreter imports its own copy of the polars package
-           (Pyronova isolate): every write must land in the owning interpreter;
+           (one copy per interpreter): every write must land in the owning interpreter;
   shared — one polars package imported by every interpreter: a foreign attach
            must fail loudly (AmbiguousInterpreter), never land in main.
 

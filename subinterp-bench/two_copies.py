@@ -3,7 +3,7 @@
 Every extension `.so` carries its own copy of PyO3's statics. Before the fix, the fork kept the
 per-interpreter registry under ONE fixed key in the interpreter dict, so the second PyO3 extension
 loaded into an interpreter found the first one's registry and read its slots by its own indices.
-Measured: `import pyronova.engine` then a fork-built `import polars` segfaulted, main or sub,
+Measured: mipyre's engine then a fork-built `import polars` segfaulted, main or sub,
 either order; two copies of this probe's `abi3t.so` segfault the same way.
 
 For each build and each place, this loads two physically separate copies of `abi3t.so` into the

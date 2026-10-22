@@ -9,7 +9,7 @@
 用法: pool_soak.py <polars 包目录> <解释器数 N> <秒数> [collect|write] [shared|copies]
 
   shared(默认)= 所有解释器 import 同一份包;copies = 每个解释器一份物理拷贝
-  (Pyronova 的 isolate 路线)。M1.3 之后,shared 下工作线程回调 Python 会大声失败
+  (每解释器一份副本的路线)。M1.3 之后,shared 下工作线程回调 Python 会大声失败
   (AmbiguousInterpreter),所以池子的正确性要在 copies 下验;shared 验的是"只许大声失败,
   不许 SIGABRT / 静默损坏"。
 

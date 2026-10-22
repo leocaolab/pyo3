@@ -206,3 +206,54 @@ fork 每一行都高于对照,而且和"根本不加载扩展"持平 —— 每�
 **④ "一批一起关"和"一个一个关"抓的不是同一个 bug。** 那个 2.6 MB/解释器的泄漏,
 在 16 个一起关的表里只表现为"回收 0%",看着像延迟释放;换成一次只活一个、做 300 次,
 才现出线性不收敛的原形。`reclaim.py` 和 `leak.py` 都得跑。
+
+## Measured results
+
+Two machines: an ARM64 MacBook (6 performance + 12 efficiency cores) and an 8-core / 16-thread
+x86_64 Linux box. Python 3.14. The control is always this branch's parent commit `dfdbc46`,
+not a crates.io release.
+
+Capability:
+
+| | parent | this branch |
+|---|---|---|
+| 6 sub-interpreters import (with the override) | 6/6, but **one** type object address | 6/6, **6** addresses |
+| 6 sub-interpreters import (no override) | 0/6 `ImportError` | **6/6** |
+| submodules (`wrap_pymodule!`) | 1/6, the rest raise pyo3#576 | **6/6** |
+| creating objects concurrently | **SIGSEGV / SIGABRT** | correct |
+
+Scaling, 12 workers creating objects (`scaling.py`):
+
+| | parent | this branch |
+|---|---:|---:|
+| MacBook | 1.20× | **9.54×** |
+| Linux box | 1.48× | **6.70×** (6.95× at 8 workers, = physical cores) |
+
+Mechanism: upstream shares one type object across interpreters, so every instantiation touches
+one refcount and every core contends on one cache line. Paths that never touch a type object
+(plain calls, detached compute) differ by < 1%.
+
+Memory (`leak.py`, `reclaim.py`):
+
+| | parent | this branch |
+|---|---:|---:|
+| leak, 1000 interpreters in sequence | +2.7 MB per 1000 | **+0.3 MB per 1000** |
+| reclaimed after closing · macOS | 48.1–48.3% | **51.3–51.5%** |
+| reclaimed after closing · Linux | 63.1–63.5% | **66.4–66.8%** |
+
+The ceiling is not loading the extension at all (macOS 51.4%, Linux 68.0%).
+
+Per-call cost (`single.py`):
+
+| | parent | this branch |
+|---|---:|---:|
+| FFI boundary · macOS | 2.06 ns | **1.48 ns** |
+| FFI boundary · Linux | 4.23 ns | **2.75 ns** |
+| type object lookup · macOS | 2.22 ns* | **1.35 ns** |
+| type object lookup · Linux | 3.42 ns* | **2.04 ns** |
+
+\* here "parent" is this branch before its own optimisation; upstream's lookup is 0.20–0.23 ns
+(one atomic read), and a per-interpreter lookup is necessarily dearer: the price of isolation.
+Single-threaded end to end there is no regression: a bare call −2.9% (noise ±1.5%), object
+creation and method calls within noise.
+

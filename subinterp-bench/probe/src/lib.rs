@@ -225,7 +225,7 @@ fn attach_on_new_thread(py: Python<'_>) -> i64 {
     })
 }
 
-/// Pyronova-style worker: a native thread whose FIRST thread state belongs to
+/// mipyre-style worker: a native thread whose FIRST thread state belongs to
 /// the interpreter at `ptr`. Returns (expected, after_detach, new_thread).
 #[cfg(not(feature = "abi3"))]
 #[pyfunction]
