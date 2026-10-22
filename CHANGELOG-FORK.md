@@ -17,6 +17,153 @@ Changes in this fork relative to upstream PyO3. Upstream's own changes are in
 The goal is own-GIL sub-interpreters (PEP 684): one extension used by several
 interpreters in one process, each running under its own GIL.
 
+## Unreleased
+
+No code change over `subinterp-2026-10-16.5`.
+
+### Changed (tests and docs only)
+
+- Ledger #2's regression test shows the power of its check from both sides:
+  `cells_sharing_storage_are_detected` feeds it two names for one cell (the shape the zero-sized
+  cell produced) and expects it to fail, and a compile-time assert keeps `PerInterpreterCell`
+  non-zero-sized.
+- `JOURNAL.md` (a working log) is removed; its measurements are in
+  `subinterp-bench/README.md` "Measured results". References to private projects and hosts in the
+  docs, comments and probes are replaced with generic wording.
+
+## `subinterp-2026-10-16.5`
+
+To use it:
+
+```toml
+[patch.crates-io]
+pyo3 = { git = "https://github.com/leocaolab/pyo3", tag = "subinterp-2026-10-16.5" }
+```
+
+A fix over `subinterp-2026-10-16.4`; no signature changed. One panic is gone.
+
+### Changed
+
+- `InterpreterHandle::try_attach` and `attach` no longer panic on a thread that is bound to a
+  different interpreter but detached from it (inside `py.detach` there). They visit with a
+  temporary thread state, as on a thread with none, and when the visit ends (also while a panic
+  in `f` unwinds) bind the thread to its own thread state again: CPython binds the thread to
+  whichever thread state was attached last, and deleting the temporary one leaves it bound to
+  none. Rebinding attaches the thread's own thread state for a moment, so it takes that
+  interpreter's GIL. Afterwards `bound`, `PyGILState_GetThisThreadState` and `PyGILState_Check`
+  answer as before. A thread *attached* to a different interpreter still panics. Ledger row #28.
+- Regression tests in `tests/test_subinterp_identity.rs`:
+  `try_attach_from_a_thread_bound_to_another_interpreter_keeps_its_binding`,
+  `a_panic_in_try_attach_from_a_thread_bound_to_another_interpreter_keeps_its_binding`,
+  `try_attach_while_attached_to_another_interpreter_panics`.
+
+### Fixed (tests only)
+
+- The lib unit tests no longer fail to compile on the limited API (`cargo test --lib
+  --features abi3-py310`): the three in `sync::interpreter_handle` that call `PyGILState_Check`,
+  which pyo3-ffi has only off the limited API, are compiled only there. CI builds abi3 with
+  `cargo check`, which does not compile tests, so it did not see this.
+
+## `subinterp-2026-10-16.4`
+
+To use it:
+
+```toml
+[patch.crates-io]
+pyo3 = { git = "https://github.com/leocaolab/pyo3", tag = "subinterp-2026-10-16.4" }
+```
+
+A fix over `subinterp-2026-10-16.3`; no signature changed.
+
+### Fixed
+
+- `InterpreterHandle::try_attach` and `attach` give the thread state back when `f` panics, as
+  they already did when it returns: a thread state made for the visit is cleared, detached and
+  deleted, and the thread's own thread state, restored for the visit, is detached again. Before,
+  a panic in `f` left the thread attached, holding the interpreter's GIL (the next attach to it
+  waited forever), and a thread state made for the visit stayed in the interpreter's list of
+  threads. Ledger row #27.
+- Regression tests: `a_panic_in_try_attach_frees_the_visits_thread_state` in
+  `tests/test_subinterp_identity.rs`, and `a_panic_in_try_attach_on_a_foreign_thread_leaves_no_thread_state`
+  and `a_panic_in_try_attach_detaches_the_threads_own_thread_state` in `sync::interpreter_handle`.
+
+## `subinterp-2026-10-16.3`
+
+To use it:
+
+```toml
+[patch.crates-io]
+pyo3 = { git = "https://github.com/leocaolab/pyo3", tag = "subinterp-2026-10-16.3" }
+```
+
+Additive over `subinterp-2026-10-16.2`: no existing item changed. `InterpreterHandle::attach`
+now runs through `try_attach`; its behaviour and its panic messages are the same.
+
+### Added
+
+- `InterpreterHandle::try_attach(self, f) -> Option<R>`: `attach`, or `None` when the thread has
+  no thread state and CPython cannot make one (`PyThreadState_New` returned null: out of
+  memory); `f` has not run then. The panics for a thread attached or bound to a different
+  interpreter are unchanged. For code that visits an interpreter from another thread and must
+  not panic when the runtime is out of memory, which so far wrote that visit by hand over
+  `new_thread_state`. Available on the limited API too. Ledger row #26.
+- Regression tests: `try_attach_runs_in_the_handles_sub_interpreter` in
+  `tests/test_subinterp_identity.rs`, and `try_attach_on_a_foreign_thread_runs_and_leaves_no_thread_state`
+  in `sync::interpreter_handle`.
+
+## `subinterp-2026-10-16.2`
+
+To use it:
+
+```toml
+[patch.crates-io]
+pyo3 = { git = "https://github.com/leocaolab/pyo3", tag = "subinterp-2026-10-16.2" }
+```
+
+Additive over `subinterp-2026-10-16.1`: no existing item changed.
+
+### Added
+
+- `InterpreterHandle::new_thread_state(self) -> Option<NonNull<ffi::PyThreadState>>`: a new
+  thread state for the handle's interpreter, made on the calling thread and not current
+  (`None` when `PyThreadState_New` returns null). On a thread with no thread state it becomes
+  the thread's own. The caller owns it and releases it by hand (the method's docs say how). For
+  code that runs thread states by hand (a thread-lifetime thread state, or a visit that has to
+  hold the interpreter's GIL for a raw call such as `PyThreadState_SetAsyncExc`) and so kept a
+  raw interpreter pointer next to the handle. Available on the limited API too. Ledger row #25.
+- Regression tests: `new_thread_state_belongs_to_the_handles_sub_interpreter` in
+  `tests/test_subinterp_identity.rs`, and `new_thread_state_becomes_the_threads_own` in
+  `sync::interpreter_handle`.
+
+## `subinterp-2026-10-16.1`
+
+To use it:
+
+```toml
+[patch.crates-io]
+pyo3 = { git = "https://github.com/leocaolab/pyo3", tag = "subinterp-2026-10-16.1" }
+```
+
+Additive over `subinterp-2026-10-14.1`: no existing item changed.
+
+### Added
+
+- `InterpreterHandle::main()`: the main interpreter's handle, with no token needed.
+- `InterpreterHandle::bound()`: the interpreter the calling thread's own thread state belongs
+  to, or `None`. Unlike `current`, it also answers on a thread that is detached.
+- `InterpreterHandle::is_main(self)` and `InterpreterHandle::id(self) -> i64` (the interpreter
+  number, main is `0`). Both read the interpreter, so the handle's lifetime rule applies.
+  `main()` is the one exception: it names the main interpreter, valid while Python runs.
+- Regression tests: `tests/test_subinterp_identity.rs` (a new process per the sub-interpreter
+  rule), and unit tests for the four methods in `sync::interpreter_handle`.
+
+### Backfilled from `subinterp-2026-10-14.1`
+
+- `Python::attach_current` (`unsafe`) was on the `subinterp-2026-10-14.1` tag but had no test,
+  no changelog entry and no ledger row, and the tag was not on the branch. It is on the branch
+  now, with a regression test (`attach_current_*` in `tests/test_subinterp_identity.rs`) and
+  ledger row #24.
+
 ## `subinterp-2026-09-23.2`
 
 Use it with `tag = "subinterp-2026-09-23.2"` in the `[patch.crates-io]` entries (same form as below).
