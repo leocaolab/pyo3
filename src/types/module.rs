@@ -1,6 +1,8 @@
 use crate::err::{PyErr, PyResult};
 use crate::ffi_ptr_ext::FfiPtrExt;
 use crate::impl_::callback::IntoPyCallbackOutput;
+#[allow(unused_imports, reason = "conditionally used")]
+use crate::platform::prelude::*;
 use crate::py_result_ext::PyResultExt;
 use crate::pyclass::PyClass;
 use crate::types::{
@@ -209,6 +211,25 @@ impl PyModule {
 /// `arbitrary_self_types`.
 #[doc(alias = "PyModule")]
 pub trait PyModuleMethods<'py>: crate::sealed::Sealed {
+    /// Stores `state` as this module object's state (PEP 489 module state): it lives in the
+    /// module, so each interpreter's module object has its own, and is dropped with the module.
+    /// Code reaches it through the module object, e.g. the one `py.import(name)` returns in the
+    /// interpreter it runs in.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the module already has a state, or was not made by PyO3's `#[pymodule]` (on
+    /// Python 3.15 and newer, PyPy and GraalPy, no PyO3 module has a state slot yet).
+    fn set_state<T: Send + Sync + 'static>(&self, state: T) -> PyResult<()>;
+
+    /// Returns this module object's state, set by [`set_state`](PyModuleMethods::set_state).
+    ///
+    /// # Errors
+    ///
+    /// Fails when the module has no state yet, has one of another type, or was not made by
+    /// PyO3's `#[pymodule]`.
+    fn state<T: Send + Sync + 'static>(&self) -> PyResult<&T>;
+
     /// Returns the module's `__dict__` attribute, which contains the module's symbol table.
     fn dict(&self) -> Bound<'py, PyDict>;
 
@@ -423,7 +444,69 @@ pub trait PyModuleMethods<'py>: crate::sealed::Sealed {
     fn gil_used(&self, gil_used: bool) -> PyResult<()>;
 }
 
+impl Bound<'_, PyModule> {
+    /// This module's state slot, when PyO3 made it.
+    fn state_slot(
+        &self,
+    ) -> PyResult<&'static core::sync::atomic::AtomicPtr<crate::impl_::pymodule::ModuleState>> {
+        #[cfg(not(any(Py_3_15, PyPy, GraalPy, all(Py_LIMITED_API, Py_GIL_DISABLED))))]
+        {
+            // SAFETY: `self` is a live module and holding a `Bound` means this thread is attached.
+            unsafe { crate::impl_::pymodule::module_state_slot(self.as_ptr()) }.ok_or_else(|| {
+                crate::exceptions::PyTypeError::new_err(
+                    "this module was not made by PyO3's #[pymodule]",
+                )
+            })
+        }
+        #[cfg(any(Py_3_15, PyPy, GraalPy, all(Py_LIMITED_API, Py_GIL_DISABLED)))]
+        {
+            Err(crate::exceptions::PyTypeError::new_err(
+                "PyO3 module state is not available on this Python yet",
+            ))
+        }
+    }
+}
+
 impl<'py> PyModuleMethods<'py> for Bound<'py, PyModule> {
+    fn set_state<T: Send + Sync + 'static>(&self, state: T) -> PyResult<()> {
+        let slot = self.state_slot()?;
+        let boxed = Box::into_raw(Box::new(crate::impl_::pymodule::ModuleState(Box::new(
+            state,
+        ))));
+        match slot.compare_exchange(
+            core::ptr::null_mut(),
+            boxed,
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Acquire,
+        ) {
+            Ok(_) => Ok(()),
+            Err(_) => {
+                // SAFETY: `boxed` was never published.
+                drop(unsafe { Box::from_raw(boxed) });
+                Err(crate::exceptions::PyRuntimeError::new_err(
+                    "this module already has a state",
+                ))
+            }
+        }
+    }
+
+    fn state<T: Send + Sync + 'static>(&self) -> PyResult<&T> {
+        let state = self
+            .state_slot()?
+            .load(core::sync::atomic::Ordering::Acquire);
+        if state.is_null() {
+            return Err(crate::exceptions::PyRuntimeError::new_err(
+                "this module has no state yet",
+            ));
+        }
+        // SAFETY: a published state is dropped only when the module is freed, and `self` holds
+        // a reference to the module for as long as the returned borrow.
+        let state = unsafe { &*state };
+        state.0.downcast_ref::<T>().ok_or_else(|| {
+            crate::exceptions::PyRuntimeError::new_err("this module's state is of another type")
+        })
+    }
+
     fn dict(&self) -> Bound<'py, PyDict> {
         unsafe {
             // PyModule_GetDict returns borrowed ptr; must make owned for safety (see #890).

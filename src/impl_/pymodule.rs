@@ -48,6 +48,79 @@ use crate::{
     Py, PyAny, Python,
 };
 
+/// One module object's state (PEP 489), held in the module's memory as a pointer to it: what
+/// `PyModuleMethods::set_state` stores and `PyModuleMethods::state` reads. Each interpreter's
+/// module object has its own, dropped with the module (`m_free`).
+pub(crate) struct ModuleState(pub(crate) Box<dyn core::any::Any + Send + Sync>);
+
+/// The module memory a PyO3 module asks CPython for: one pointer to its [`ModuleState`], null
+/// until one is set.
+#[cfg(not(any(Py_3_15, PyPy, GraalPy, all(Py_LIMITED_API, Py_GIL_DISABLED))))]
+const MODULE_STATE_SIZE: ffi::Py_ssize_t =
+    core::mem::size_of::<*mut ModuleState>() as ffi::Py_ssize_t;
+#[cfg(any(Py_3_15, PyPy, GraalPy, all(Py_LIMITED_API, Py_GIL_DISABLED)))]
+const MODULE_STATE_SIZE: ffi::Py_ssize_t = 0;
+
+#[cfg(not(any(Py_3_15, PyPy, GraalPy, all(Py_LIMITED_API, Py_GIL_DISABLED))))]
+const MODULE_STATE_FREE: Option<ffi::freefunc> = Some(free_module_state);
+#[cfg(any(Py_3_15, PyPy, GraalPy, all(Py_LIMITED_API, Py_GIL_DISABLED)))]
+const MODULE_STATE_FREE: Option<ffi::freefunc> = None;
+
+/// Drops a module's [`ModuleState`] as CPython frees the module.
+///
+/// # Safety
+///
+/// Called by CPython with a module made from a PyO3 `ModuleDef`, whose memory is one pointer.
+#[cfg(not(any(Py_3_15, PyPy, GraalPy, all(Py_LIMITED_API, Py_GIL_DISABLED))))]
+unsafe extern "C" fn free_module_state(module: *mut c_void) {
+    // SAFETY: the module is alive while CPython frees it; its memory is the pointer slot this
+    // def asked for, written only through `module_state_slot`.
+    unsafe {
+        let slot = ffi::PyModule_GetState(module.cast())
+            .cast::<core::sync::atomic::AtomicPtr<ModuleState>>();
+        if slot.is_null() {
+            return;
+        }
+        let state = (*slot).swap(core::ptr::null_mut(), core::sync::atomic::Ordering::AcqRel);
+        if !state.is_null() {
+            drop(Box::from_raw(state));
+        }
+    }
+}
+
+/// The state slot of `module`, or `None` when `module` was not made from a PyO3 `ModuleDef` of
+/// this copy of PyO3 (its def's `m_free` is not ours), so its memory is not a state slot.
+///
+/// # Safety
+///
+/// `module` is a live module object and the caller is attached to its interpreter.
+#[cfg(not(any(Py_3_15, PyPy, GraalPy, all(Py_LIMITED_API, Py_GIL_DISABLED))))]
+pub(crate) unsafe fn module_state_slot(
+    module: *mut ffi::PyObject,
+) -> Option<&'static core::sync::atomic::AtomicPtr<ModuleState>> {
+    // SAFETY: as the caller promises; a def is static for the module's lifetime.
+    unsafe {
+        let def = ffi::PyModule_GetDef(module);
+        // Only this function frees PyO3's state, so a def naming it is one of ours. Two copies of
+        // the function (codegen units) could make this say no to one of ours, never yes to another's.
+        let ours = !def.is_null()
+            && (*def).m_size == MODULE_STATE_SIZE
+            && (*def)
+                .m_free
+                .is_some_and(|free| free as usize == free_module_state as ffi::freefunc as usize);
+        if !ours {
+            ffi::PyErr_Clear();
+            return None;
+        }
+        let slot = ffi::PyModule_GetState(module);
+        if slot.is_null() {
+            ffi::PyErr_Clear();
+            return None;
+        }
+        Some(&*slot.cast::<core::sync::atomic::AtomicPtr<ModuleState>>())
+    }
+}
+
 /// `Sync` wrapper of `ffi::PyModuleDef`.
 pub struct ModuleDef {
     // wrapped in UnsafeCell so that Rust compiler treats this as interior mutability
@@ -84,7 +157,7 @@ impl ModuleDef {
             m_base: ffi::PyModuleDef_HEAD_INIT,
             m_name: name.as_ptr(),
             m_doc: doc.as_ptr(),
-            m_size: 0,
+            m_size: MODULE_STATE_SIZE,
             m_methods: core::ptr::null_mut(),
             m_slots: array_ptr_as_mut({
                 cfg_select! {
@@ -94,7 +167,7 @@ impl ModuleDef {
             }),
             m_traverse: None,
             m_clear: None,
-            m_free: None,
+            m_free: MODULE_STATE_FREE,
         });
 
         #[cfg(any(not(Py_3_15), all(Py_LIMITED_API, Py_GIL_DISABLED)))]

@@ -17,11 +17,30 @@ Changes in this fork relative to upstream PyO3. Upstream's own changes are in
 The goal is own-GIL sub-interpreters (PEP 684): one extension used by several
 interpreters in one process, each running under its own GIL.
 
-## Unreleased
+## `subinterp-2026-10-22.1`
 
-No code change over `subinterp-2026-10-16.5`.
+To use it:
 
-### Changed (tests and docs only)
+```toml
+[patch.crates-io]
+pyo3 = { git = "https://github.com/leocaolab/pyo3", tag = "subinterp-2026-10-22.1" }
+```
+
+### Added
+
+- PEP 489 module state. A `#[pymodule]` module now asks CPython for one pointer of module memory
+  (`m_size`) and frees what it holds (`m_free`), so each interpreter's module object can carry
+  its own state, dropped with the module: `PyModuleMethods::set_state(value)` (once; a second
+  call is an error) and `PyModuleMethods::state::<T>()`. Code reaches the module of the
+  interpreter it runs in through that interpreter's own `sys.modules` (`py.import(name)`), not
+  through a process-wide table. A module PyO3 did not make has no state slot (`TypeError`); a
+  state of another type is not handed out. Python 3.13 and 3.14; not yet on 3.15 (module slots),
+  PyPy, GraalPy or the free-threaded limited API. Ledger row #29.
+- Regression test `tests/test_subinterp_module_state.rs`: three sub-interpreters each set and read
+  their own module's state, a second `set_state` is refused, a state of another type is not
+  returned, and each interpreter's end drops its state; a module PyO3 did not make (`sys`) has none.
+
+### Changed (tests and docs only, since `subinterp-2026-10-16.5`)
 
 - Ledger #2's regression test shows the power of its check from both sides:
   `cells_sharing_storage_are_detected` feeds it two names for one cell (the shape the zero-sized
