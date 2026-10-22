@@ -32,7 +32,10 @@ fn each_interpreter_s_module_has_its_own_state_and_drops_it_with_the_module() {
         let module = pyo3::wrap_pymodule!(state_probe)(py).into_bound(py);
         let module = module.cast::<PyModule>().unwrap();
         let mine = interp_id(py);
-        assert!(module.state::<Assignment>().is_err(), "a new module has no state yet");
+        assert!(
+            module.state::<Assignment>().is_err(),
+            "a new module has no state yet"
+        );
         module.set_state(Assignment { interpreter: mine }).unwrap();
         // The same module object, found again, holds what this interpreter set.
         let again = pyo3::wrap_pymodule!(state_probe)(py).into_bound(py);
@@ -40,7 +43,10 @@ fn each_interpreter_s_module_has_its_own_state_and_drops_it_with_the_module() {
         let read = again.state::<Assignment>().unwrap().interpreter;
         // Set once: a second state is refused and the first stays.
         assert!(module.set_state(Assignment { interpreter: -1 }).is_err());
-        assert!(module.state::<String>().is_err(), "a state of another type is not handed out");
+        assert!(
+            module.state::<String>().is_err(),
+            "a state of another type is not handed out"
+        );
         (mine, read, again.state::<Assignment>().unwrap().interpreter)
     });
     for (mine, read, after_refusal) in &seen {

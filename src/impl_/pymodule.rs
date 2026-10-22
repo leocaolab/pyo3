@@ -56,7 +56,8 @@ pub(crate) struct ModuleState(pub(crate) Box<dyn core::any::Any + Send + Sync>);
 /// The module memory a PyO3 module asks CPython for: one pointer to its [`ModuleState`], null
 /// until one is set.
 #[cfg(not(any(Py_3_15, PyPy, GraalPy, all(Py_LIMITED_API, Py_GIL_DISABLED))))]
-const MODULE_STATE_SIZE: ffi::Py_ssize_t = core::mem::size_of::<*mut ModuleState>() as ffi::Py_ssize_t;
+const MODULE_STATE_SIZE: ffi::Py_ssize_t =
+    core::mem::size_of::<*mut ModuleState>() as ffi::Py_ssize_t;
 #[cfg(any(Py_3_15, PyPy, GraalPy, all(Py_LIMITED_API, Py_GIL_DISABLED)))]
 const MODULE_STATE_SIZE: ffi::Py_ssize_t = 0;
 
@@ -75,7 +76,8 @@ unsafe extern "C" fn free_module_state(module: *mut c_void) {
     // SAFETY: the module is alive while CPython frees it; its memory is the pointer slot this
     // def asked for, written only through `module_state_slot`.
     unsafe {
-        let slot = ffi::PyModule_GetState(module.cast()).cast::<core::sync::atomic::AtomicPtr<ModuleState>>();
+        let slot = ffi::PyModule_GetState(module.cast())
+            .cast::<core::sync::atomic::AtomicPtr<ModuleState>>();
         if slot.is_null() {
             return;
         }
@@ -103,7 +105,9 @@ pub(crate) unsafe fn module_state_slot(
         // the function (codegen units) could make this say no to one of ours, never yes to another's.
         let ours = !def.is_null()
             && (*def).m_size == MODULE_STATE_SIZE
-            && (*def).m_free.is_some_and(|free| free as usize == free_module_state as ffi::freefunc as usize);
+            && (*def)
+                .m_free
+                .is_some_and(|free| free as usize == free_module_state as ffi::freefunc as usize);
         if !ours {
             ffi::PyErr_Clear();
             return None;

@@ -1,8 +1,8 @@
 use crate::err::{PyErr, PyResult};
-#[allow(unused_imports, reason = "conditionally used")]
-use crate::platform::prelude::*;
 use crate::ffi_ptr_ext::FfiPtrExt;
 use crate::impl_::callback::IntoPyCallbackOutput;
+#[allow(unused_imports, reason = "conditionally used")]
+use crate::platform::prelude::*;
 use crate::py_result_ext::PyResultExt;
 use crate::pyclass::PyClass;
 use crate::types::{
@@ -446,12 +446,17 @@ pub trait PyModuleMethods<'py>: crate::sealed::Sealed {
 
 impl Bound<'_, PyModule> {
     /// This module's state slot, when PyO3 made it.
-    fn state_slot(&self) -> PyResult<&'static core::sync::atomic::AtomicPtr<crate::impl_::pymodule::ModuleState>> {
+    fn state_slot(
+        &self,
+    ) -> PyResult<&'static core::sync::atomic::AtomicPtr<crate::impl_::pymodule::ModuleState>> {
         #[cfg(not(any(Py_3_15, PyPy, GraalPy, all(Py_LIMITED_API, Py_GIL_DISABLED))))]
         {
             // SAFETY: `self` is a live module and holding a `Bound` means this thread is attached.
-            unsafe { crate::impl_::pymodule::module_state_slot(self.as_ptr()) }
-                .ok_or_else(|| crate::exceptions::PyTypeError::new_err("this module was not made by PyO3's #[pymodule]"))
+            unsafe { crate::impl_::pymodule::module_state_slot(self.as_ptr()) }.ok_or_else(|| {
+                crate::exceptions::PyTypeError::new_err(
+                    "this module was not made by PyO3's #[pymodule]",
+                )
+            })
         }
         #[cfg(any(Py_3_15, PyPy, GraalPy, all(Py_LIMITED_API, Py_GIL_DISABLED)))]
         {
@@ -465,7 +470,9 @@ impl Bound<'_, PyModule> {
 impl<'py> PyModuleMethods<'py> for Bound<'py, PyModule> {
     fn set_state<T: Send + Sync + 'static>(&self, state: T) -> PyResult<()> {
         let slot = self.state_slot()?;
-        let boxed = Box::into_raw(Box::new(crate::impl_::pymodule::ModuleState(Box::new(state))));
+        let boxed = Box::into_raw(Box::new(crate::impl_::pymodule::ModuleState(Box::new(
+            state,
+        ))));
         match slot.compare_exchange(
             core::ptr::null_mut(),
             boxed,
@@ -476,23 +483,28 @@ impl<'py> PyModuleMethods<'py> for Bound<'py, PyModule> {
             Err(_) => {
                 // SAFETY: `boxed` was never published.
                 drop(unsafe { Box::from_raw(boxed) });
-                Err(crate::exceptions::PyRuntimeError::new_err("this module already has a state"))
+                Err(crate::exceptions::PyRuntimeError::new_err(
+                    "this module already has a state",
+                ))
             }
         }
     }
 
     fn state<T: Send + Sync + 'static>(&self) -> PyResult<&T> {
-        let state = self.state_slot()?.load(core::sync::atomic::Ordering::Acquire);
+        let state = self
+            .state_slot()?
+            .load(core::sync::atomic::Ordering::Acquire);
         if state.is_null() {
-            return Err(crate::exceptions::PyRuntimeError::new_err("this module has no state yet"));
+            return Err(crate::exceptions::PyRuntimeError::new_err(
+                "this module has no state yet",
+            ));
         }
         // SAFETY: a published state is dropped only when the module is freed, and `self` holds
         // a reference to the module for as long as the returned borrow.
         let state = unsafe { &*state };
-        state
-            .0
-            .downcast_ref::<T>()
-            .ok_or_else(|| crate::exceptions::PyRuntimeError::new_err("this module's state is of another type"))
+        state.0.downcast_ref::<T>().ok_or_else(|| {
+            crate::exceptions::PyRuntimeError::new_err("this module's state is of another type")
+        })
     }
 
     fn dict(&self) -> Bound<'py, PyDict> {
