@@ -18,16 +18,16 @@
 >
 > ```toml
 > [patch.crates-io]
-> pyo3 = { git = "https://github.com/leocaolab/pyo3", tag = "subinterp-2026-09-23.2" }
-> pyo3-ffi = { git = "https://github.com/leocaolab/pyo3", tag = "subinterp-2026-09-23.2" }
-> pyo3-macros = { git = "https://github.com/leocaolab/pyo3", tag = "subinterp-2026-09-23.2" }
-> pyo3-macros-backend = { git = "https://github.com/leocaolab/pyo3", tag = "subinterp-2026-09-23.2" }
-> pyo3-build-config = { git = "https://github.com/leocaolab/pyo3", tag = "subinterp-2026-09-23.2" }
+> pyo3 = { git = "https://github.com/leocaolab/pyo3", tag = "subinterp-2026-10-16.5" }
+> pyo3-ffi = { git = "https://github.com/leocaolab/pyo3", tag = "subinterp-2026-10-16.5" }
+> pyo3-macros = { git = "https://github.com/leocaolab/pyo3", tag = "subinterp-2026-10-16.5" }
+> pyo3-macros-backend = { git = "https://github.com/leocaolab/pyo3", tag = "subinterp-2026-10-16.5" }
+> pyo3-build-config = { git = "https://github.com/leocaolab/pyo3", tag = "subinterp-2026-10-16.5" }
 > ```
 >
 > ### How it differs from upstream PyO3
 >
-> 22 defects fixed, each with a regression test that fails on the unfixed code. Numbers
+> 28 defects fixed, each with a regression test that fails on the unfixed code. Numbers
 > refer to the [bug ledger](SUBINTERP-FIXES.md#bug-ledger); history is in
 > [`CHANGELOG-FORK.md`](CHANGELOG-FORK.md).
 >
@@ -37,7 +37,7 @@
 > | Module object (#7) | cached per process; a second interpreter gets `ImportError` (#576) | one per interpreter, and submodules too |
 > | Caches (#12, #14, #15, #16) | `PyOnceLock`, `intern!` (mortal on 3.12–3.14), the conversion layer's stdlib classes and the type-init thread list are per process: wrong-interpreter objects (polars got another interpreter's `Int64`), teardown segfaults, a deadlock when 4 interpreters import polars at once | all per interpreter |
 > | Deferred decrefs (#18, #19) | one pool per process: interpreter B applies A's decrefs (silent heap corruption on glibc) | one pool per interpreter; the owner is recorded when the decref is queued |
-> | Foreign threads (#13, #22) | `Python::attach` on a thread with no thread state (rayon, tokio) lands in the **main** interpreter | lands in the interpreter that executed this extension copy's module; fails loudly if that is ambiguous. `InterpreterHandle` attaches to an explicit interpreter from any thread |
+> | Foreign threads (#13, #22–#28) | `Python::attach` on a thread with no thread state (rayon, tokio) lands in the **main** interpreter | lands in the interpreter that executed this extension copy's module; fails loudly if that is ambiguous. `InterpreterHandle` attaches to an explicit interpreter from any thread, including one bound to another interpreter, and gives the thread state back on panic |
 > | Teardown (#3, #5, #6, #20) | per-interpreter values are never reclaimed (2.6–3.7 MB per interpreter, unbounded) | released at `Py_EndInterpreter` |
 > | Declaration (#8–#11) | no `Py_MOD_PER_INTERPRETER_GIL_SUPPORTED`, so strict mode refuses the module (abi3 included) | declared by every `#[pymodule]`, abi3 included |
 > | Several extensions (#21) | — | each extension copy keeps its own registry, so two fork-built extensions share one process (e.g. mipyre + polars) |

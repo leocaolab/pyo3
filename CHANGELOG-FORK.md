@@ -17,6 +17,20 @@ Changes in this fork relative to upstream PyO3. Upstream's own changes are in
 The goal is own-GIL sub-interpreters (PEP 684): one extension used by several
 interpreters in one process, each running under its own GIL.
 
+## Unreleased
+
+No code change over `subinterp-2026-10-16.5`.
+
+### Changed (tests and docs only)
+
+- Ledger #2's regression test shows the power of its check from both sides:
+  `cells_sharing_storage_are_detected` feeds it two names for one cell (the shape the zero-sized
+  cell produced) and expects it to fail, and a compile-time assert keeps `PerInterpreterCell`
+  non-zero-sized.
+- `JOURNAL.md` (a working log) is removed; its measurements are in
+  `subinterp-bench/README.md` "Measured results". References to private projects and hosts in the
+  docs, comments and probes are replaced with generic wording.
+
 ## `subinterp-2026-10-16.5`
 
 To use it:

@@ -421,9 +421,27 @@ fn cell_is_empty_after_teardown() {
 
 /// Ledger #2: two cells declared next to each other must not share storage.
 ///
-/// They are zero-sized but for the index field, and two zero-sized fields of one struct can
-/// share an address, which made both cells claim the same slot, overwrite each other, and abort
-/// all 850 tests with a null type pointer.
+/// Before the fix the cell was zero-sized, and two zero-sized fields of one struct can share an
+/// address; the address was the cell's key, so both cells claimed the same slot, overwrote each
+/// other, and aborted all 850 tests with a null type pointer. The cell now owns its index in an
+/// `AtomicUsize` field, so it is never zero-sized: checked at compile time below.
+const _: () = assert!(core::mem::size_of::<PerInterpreterCell<Py<PyAny>>>() != 0);
+
+/// Writes `"first"` through `a`, then `"second"` through `b`, and reports whether each reads back
+/// its own value. False exactly when `a` and `b` share storage.
+fn each_keeps_its_own(
+    py: Python<'_>,
+    a: &PerInterpreterCell<Py<PyAny>>,
+    b: &PerInterpreterCell<Py<PyAny>>,
+) -> bool {
+    let first: Py<PyAny> = py.eval(c"'first'", None, None).unwrap().unbind();
+    let second: Py<PyAny> = py.eval(c"'second'", None, None).unwrap().unbind();
+    a.get_or_init(py, || first.clone_ref(py));
+    b.get_or_init(py, || second.clone_ref(py));
+    a.get(py).unwrap().bind(py).eq("first").unwrap()
+        && b.get(py).unwrap().bind(py).eq("second").unwrap()
+}
+
 #[test]
 fn neighbouring_cells_have_distinct_slots() {
     in_sub_interpreter(|py| {
@@ -435,14 +453,18 @@ fn neighbouring_cells_have_distinct_slots() {
             a: PerInterpreterCell::new(),
             b: PerInterpreterCell::new(),
         };
+        assert!(each_keeps_its_own(py, &PAIR.a, &PAIR.b));
+    });
+}
 
-        let first: Py<PyAny> = py.eval(c"'first'", None, None).unwrap().unbind();
-        let second: Py<PyAny> = py.eval(c"'second'", None, None).unwrap().unbind();
-        PAIR.a.get_or_init(py, || first.clone_ref(py));
-        PAIR.b.get_or_init(py, || second.clone_ref(py));
-
-        assert!(PAIR.a.get(py).unwrap().bind(py).eq("first").unwrap());
-        assert!(PAIR.b.get(py).unwrap().bind(py).eq("second").unwrap());
+/// The other side of ledger #2's check: two names for one storage, the shape the zero-sized cell
+/// produced, must make `each_keeps_its_own` false. Without this the check above could pass for
+/// a reason unrelated to the cells being distinct.
+#[test]
+fn cells_sharing_storage_are_detected() {
+    in_sub_interpreter(|py| {
+        static ONE: PerInterpreterCell<Py<PyAny>> = PerInterpreterCell::new();
+        assert!(!each_keeps_its_own(py, &ONE, &ONE));
     });
 }
 
