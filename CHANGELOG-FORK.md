@@ -9,7 +9,7 @@ Changes in this fork relative to upstream PyO3. Upstream's own changes are in
   `[patch.crates-io]` at a tag. A pre-release version such as `0.29.3-x` does not satisfy
   `pyo3 = "0.29"`: Cargo then drops the patch with only a warning and silently builds
   upstream (measured).
-- **Supported Python:** 3.13 and 3.14 (the minimum for Pyronova and SkyTrade).
+- **Supported Python:** 3.13 and 3.14 (the minimum this fork targets).
   3.12 was measured too; problems specific to 3.12 are out of scope.
 - **Evidence:** every claim below is measured by a script in `subinterp-bench/`. The plan,
   the per-milestone status and the full numbers are in [`SUBINTERP-FIXES.md`](SUBINTERP-FIXES.md).
@@ -159,7 +159,7 @@ Use it with `tag = "subinterp-2026-09-23.2"` in the `[patch.crates-io]` entries 
 - **Two PyO3 extensions in one interpreter** (#21). The per-interpreter registry was kept
   under one fixed key in the interpreter dict, but every extension `.so` numbers its slots on
   its own. The second PyO3 extension loaded into an interpreter read the first one's slots:
-  pyronova's engine followed by a fork-built polars segfaulted, in the main interpreter or a
+  mipyre's engine followed by a fork-built polars segfaulted, in the main interpreter or a
   sub-interpreter, in either order. Only the first extension's teardown hook was registered, so
   the second one's values and queued decrefs were never released at `Py_EndInterpreter`. The
   keys are now per extension copy.
@@ -311,7 +311,7 @@ The numbers are on macOS and Python 3.14 unless noted.
   that is a use-after-free (upstream instead used the wrong interpreter's object).
 - An extension shared by several interpreters cannot call back into Python, or drop a
   `Py<T>`, on a thread pool without `InterpreterHandle`. Both fail loudly. The supported
-  route is one copy of the extension per interpreter (Pyronova's `isolate`).
+  route is one copy of the extension per interpreter (mipyre's `isolate`).
 - On 3.12, in a sub-interpreter that falls back to the pure-Python `_pydatetime`, the
   datetime conversions use another interpreter's C-API table. This is out of scope: the
   minimum supported Python is 3.13, where all interpreters share one table.

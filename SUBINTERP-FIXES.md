@@ -1,7 +1,7 @@
 # Per-interpreter PyO3: what still needs fixing, and how
 
-Branch `subinterp-per-interpreter-state`, 2026-09-22. English companion to
-`JOURNAL.md` (what is done) and `subinterp-bench/BUG-POOL.md` (bug A).
+Branch `subinterp-per-interpreter-state`, 2026-09-22. Companion to
+`CHANGELOG-FORK.md` (what is done) and `subinterp-bench/BUG-POOL.md` (bug A).
 
 The branch already makes `#[pyclass]` type objects, `create_exception!` types
 and module objects per interpreter, removes upstream's second-interpreter guard,
@@ -15,8 +15,8 @@ thread, must know which interpreter that is. When it cannot know, it must fail
 loudly, never fall back to the main interpreter.
 
 **Why it matters now:** the polars audit (`leocaolab/polars`, `subinterp`
-branch, `SUBINTERP-AUDIT.md`) and the Pyronova design
-(`pyre/docs/design/polars-in-subinterpreters.md`) depend on these fixes.
+branch, `SUBINTERP-AUDIT.md`) and mipyre's design for running polars in
+sub-interpreters depend on these fixes.
 Phase 1 there (one polars copy per worker) needs **M1** only. Phase 2 (one
 shared polars) needs M1–M4.
 
@@ -34,7 +34,7 @@ shared polars) needs M1–M4.
 | A-dead | `73f61bb` "fix" that never executes (`note_interpreter`, `first_interp`, `multiple_seen`, the sorting branch) | `src/internal/state.rs:227-360` | dead code that claims to fix A |
 | C | teardown runs `PyImport_ImportModule("gc")` inside `Py_EndInterpreter` | `src/sync/per_interpreter.rs:357` | segfault on destroy after parallel work (weak attribution) |
 | D | ~60 KB leaked per interpreter lifetime; import 3.7× slower (legacy config A/B) | registry lifecycle | leak + start-up cost |
-| audit | ~20 of 79 PyO3-internal cache sites never checked at runtime | `JOURNAL.md` "分支自身还欠的" | unknown |
+| audit | ~20 of 79 PyO3-internal cache sites never checked at runtime | `subinterp-bench/audit_caches.py` | unknown |
 
 ---
 
@@ -57,7 +57,7 @@ Add to `subinterp-bench/probe` (upstream and fork builds, existing `build.sh`):
 two thread origins:
 
 - **Rust-style worker**: a thread whose first thread state is the
-  sub-interpreter's (what Pyronova does);
+  sub-interpreter's (what mipyre's workers are);
 - **Python thread**: a `threading.Thread` of the main interpreter that then runs
   the sub-interpreter (what `concurrent.interpreters` + `threading` does).
 
@@ -193,7 +193,7 @@ on 3.12.13, 3.13.15 and 3.14.7 (macOS).
 | every `PyOnceLock` static: 53 declarations in `src/` (builtin type caches in `types/*.rs`, `pathlib`/`ipaddress`/`decimal`/`uuid`/`zoneinfo`/`collections.abc` classes in conversions, `ImportedExceptionTypeObject`, `err_state`, `get_slot`, `coroutine/waker`) plus macro-generated enum `SINGLETON` and `FREELIST` | Python objects | per interpreter (M2.2) | `conv_probe.py`: `PathBuf` → own `pathlib.Path`, `Ipv4Addr` → own `IPv4Address`: fork 4/4 on every build and deploy; upstream shared .so 1/4. `cache_probe.py`: own `sys` 4/4 |
 | `Interned` / `intern!` | `PyString` | per interpreter (M2.1) | `cache_probe.py` 4/4 |
 | `LazyTypeObject` (`value`, `fully_initialized_type`, `initializing_threads`), `ModuleDef.module` | type / module objects, init bookkeeping | per interpreter (`PerInterpreterCell`) | `initializing_threads` fixed in M2.2 (deadlock) |
-| pyo3-ffi `PyDateTimeAPI_impl` (`AtomicPtr<PyDateTime_CAPI>`), read by PyO3's datetime types | pointer to one interpreter's datetime C-API table | **safe on the supported versions (3.13+), left process-wide.** 3.13/3.14: every interpreter gets the same immortal table (4/4, shared and copies, full API). 3.12 would be wrong (C `_datetime` loads only in the first interpreter; others get pure-Python `_pydatetime` with no C API, so PyO3 built the first interpreter's `timedelta` in the others, 1/4 correct). A per-interpreter table was written for that (`e4174d8`) and **reverted**: Pyronova and SkyTrade require Python ≥ 3.13, where it changes nothing and costs a lookup per conversion | `conv_probe.py` on 3.12.13 / 3.13.15 / 3.14.7 |
+| pyo3-ffi `PyDateTimeAPI_impl` (`AtomicPtr<PyDateTime_CAPI>`), read by PyO3's datetime types | pointer to one interpreter's datetime C-API table | **safe on the supported versions (3.13+), left process-wide.** 3.13/3.14: every interpreter gets the same immortal table (4/4, shared and copies, full API). 3.12 would be wrong (C `_datetime` loads only in the first interpreter; others get pure-Python `_pydatetime` with no C API, so PyO3 built the first interpreter's `timedelta` in the others, 1/4 correct). A per-interpreter table was written for that (`e4174d8`) and **reverted**: this fork supports Python ≥ 3.13 only, where it changes nothing and costs a lookup per conversion | `conv_probe.py` on 3.12.13 / 3.13.15 / 3.14.7 |
 | pyo3-ffi `static mut PyExc_*`, `Py*_Type` (CPython's exported static builtin types and exceptions) | CPython-owned static objects | shared by CPython by design, safe | immortal in every interpreter on 3.12, 3.13, 3.14 (`conv_probe.py`, last column) |
 | `internal/state.rs` `POOL` (`ReferencePool`) | deferred decrefs from all interpreters | **wrong**. Owned by M3 (#9–#11) | `BUG-POOL.md` |
 | `internal/home.rs` `STATE` | home interpreter pointer + flags | deliberately per `.so` copy (M1.3) | `attach_probe.py` |
@@ -277,7 +277,7 @@ that interpreter's teardown hook.
 | M3.1 dead code (#9) | done (`2a9c032`). The pool is byte-identical to upstream again, the base for M3.2 |
 | M3.2 per-interpreter pools (#10) | done. One pool per interpreter in `POOLS`, keyed by interpreter (the main interpreter under a fixed key). The owner is fixed at enqueue (`owner_now`): the thread's thread state, else HOME (M1.3), else unknown. A pool is drained only by an attach to its own interpreter, and emptied by that interpreter's teardown hook (under `AssumeAttached`). Fast path: one global dirty-pool counter, so an idle attach costs what upstream's does |
 | unknown owner | panics with an explanation, like `AttachError`. **While the thread is already panicking** (the drop is fallout of an attach that just failed loudly), it prints the reason and leaks the object instead: a second panic would abort, and that was measured turning `pool_soak.py` shared from a Python `PanicException` into exit 134 |
-| M3.3 policy (#11) | **decided (2026-09-22): fail loudly, no layout option.** An unknown owner exists only for a shared copy dropping on a foreign thread. The north-star route (Pyronova copies) always knows the owner through HOME, and in the shared configuration the attach on that same thread already fails loudly (M1.3). A 16-byte `Py<T>` would change the layout for every PyO3 user and buy nothing here |
+| M3.3 policy (#11) | **decided (2026-09-22): fail loudly, no layout option.** An unknown owner exists only for a shared copy dropping on a foreign thread. The north-star route (one extension copy per interpreter) always knows the owner through HOME, and in the shared configuration the attach on that same thread already fails loudly (M1.3). A 16-byte `Py<T>` would change the layout for every PyO3 user and buy nothing here |
 
 Evidence (3.14.7 macOS):
 
@@ -293,7 +293,7 @@ Evidence (3.14.7 macOS):
 - `attach_cost.py` (ns per `#[pyfunction]` call): idle 10.2 (upstream 10.9); with another interpreter's pool dirty 13.1 (upstream 10.6, but upstream's number is what it costs to wrongly drain that pool on the first call).
 - `leak.py` 300 rounds, before vs after M3.2: 0.2 vs 0.2–0.3 MB per thousand interpreters. Unchanged.
 - polars bug B and the write check on the new build: unchanged (80/80; copies 16/16).
-- **Linux** (bluewhale, 3.14.4): 860 unit tests; `pool_probe.py` identical to macOS (upstream shared .so: other interpreter applies the decref 5/5 on both paths; fork 0/5); `attach_probe`, `cache_probe`, `conv_probe` identical verdicts. Per-read costs are higher there (`intern!` 7.7 ns, `PyOnceLock::get` 3.4 ns vs upstream 0.96; host load ≈28; dylib TLS goes through `__tls_get_addr`). Looked at again in M5.
+- **Linux** (8-core x86_64, 3.14.4): 860 unit tests; `pool_probe.py` identical to macOS (upstream shared .so: other interpreter applies the decref 5/5 on both paths; fork 0/5); `attach_probe`, `cache_probe`, `conv_probe` identical verdicts. Per-read costs are higher there (`intern!` 7.7 ns, `PyOnceLock::get` 3.4 ns vs upstream 0.96; host load ≈28; dylib TLS goes through `__tls_get_addr`). Looked at again in M5.
 - **ASAN** (Linux, probe built with `-Zsanitizer=address`, `PYTHONMALLOC=malloc`): 0 reports for the fork **and 0 for upstream**, although upstream's wrong-interpreter decref is real (`pool_probe` 5/5). ASAN cannot see this class of bug: the damage is a free into another interpreter's obmalloc arena, which is not malloc, and an unsynchronised refcount write, which is a race. So the acceptance evidence for M3.2 is `pool_probe.py`, which checks who applied the decref and does not depend on the allocator. The ASAN run only shows the fork adds no malloc-level memory errors.
 
 ### M3 acceptance
@@ -357,7 +357,7 @@ measurement exactly. What can be measured:
 **Decided (2026-09-22): acceptance revised, #13 closed.** The original criteria compared
 against an upstream that cannot load. The revised criteria, both met: import cost within
 1.2× of upstream in the main interpreter (1.02×), and PyO3's own per-interpreter slope at
-the probe's level (`leak.py` 0.2 KB per interpreter, unchanged across M3.2). Pyronova's
+the probe's level (`leak.py` 0.2 KB per interpreter, unchanged across M3.2). mipyre's
 workers live as long as the process, so 52 KB per interpreter lifetime is not on the
 north-star path. Where the 52 KB goes is not investigated.
 
@@ -396,7 +396,7 @@ before the tests that created one.
 | 18 | the deferred-decref pool is one per process: B applies A's decrefs (bug A) | `629bbc1` | `pool_probe.py` 5/5 → 0/5 | `tests/test_subinterp_isolation.rs` `deferred_decref_is_applied_by_its_own_interpreter_only` ✔; teardown drain: `tests/test_subinterp_home.rs` ✔ |
 | 19 | an unknown-owner drop during unwinding aborts the process (found while fixing #18) | `629bbc1` | `pool_soak.py` shared, exit 134 → `PanicException` | `tests/test_subinterp_shared.rs` ✔ |
 | 20 | teardown imports `gc` inside `Py_EndInterpreter` (hardening; the crash blamed on it was #15) | `f4faf9d` | `teardown_check.py` | `tests/test_subinterp_teardown.rs` ✔ |
-| 21 | the per-interpreter registry, teardown-hook and `gc.collect` keys are one fixed name, but every extension copy has its own slot numbering: the second PyO3 extension in an interpreter reads the first one's slots (segfault), and only the first copy's teardown hook is registered | `a56473b` | pyronova engine + fork-built polars in one interpreter: segfault in `add_class::<PyDataFrame>`; two copies of `abi3t.so`: exit -11 | CI probe `two_copies.py` (main + 4 sub-interpreters) — `ci_verdicts.py` ✔ |
+| 21 | the per-interpreter registry, teardown-hook and `gc.collect` keys are one fixed name, but every extension copy has its own slot numbering: the second PyO3 extension in an interpreter reads the first one's slots (segfault), and only the first copy's teardown hook is registered | `a56473b` | mipyre's engine + fork-built polars in one interpreter: segfault in `add_class::<PyDataFrame>`; two copies of `abi3t.so`: exit -11 | CI probe `two_copies.py` (main + 4 sub-interpreters) — `ci_verdicts.py` ✔ |
 | 22 | `InterpreterHandle::attach` treats the thread's *bound* thread state as attached: inside `py.detach` (or a worker between requests) it ran `f` without the GIL | `3573c06` | `PyInterpreterState_Get: … the GIL is released` abort | `sync::interpreter_handle::tests::attach_inside_detach_holds_the_gil` ✔ and `tests/test_subinterp_isolation.rs` `interpreter_handle_attach_inside_detach_restores_the_thread_state` ✔ |
 | 23 | `InterpreterHandle` cannot say which interpreter it names: no `is_main`, `id`, or way to get the main or the bound one. pyre therefore kept a second, raw copy of the same pointer next to each handle (`CapturedInterpreter`) to answer those questions | `subinterp-2026-10-16.1` | pyre `crates/apps/pyext/src/interp/run_context.rs` (the wrapper that this closes) | `tests/test_subinterp_identity.rs` `a_sub_interpreter_handle_is_not_main_and_has_its_own_id` ✔ (`is_main`, `id`, `main`), `bound_names_the_sub_interpreter_inside_detach` ✔ (`bound`); lib: `sync::interpreter_handle::tests::{main_is_the_main_interpreter, bound_is_none_on_a_thread_without_a_thread_state, bound_survives_detaching}` |
 | 24 | `Python::attach_current` (for a thread whose thread state is already current, made so with raw `PyEval_RestoreThread`) had no regression test and was not in the changelog. Its own commit landed on the tag `subinterp-2026-10-14.1` only | `subinterp-2026-10-16.1` | commit `f71f12d` (no measurement in the commit; the fast path is the one the commit message describes) | `tests/test_subinterp_identity.rs` `attach_current_runs_in_the_current_thread_state` ✔ and `attach_current_applies_the_deferred_decrefs_of_its_interpreter` ✔ (the drain on entry) |
@@ -413,7 +413,7 @@ perf commits `799ab51` / `eea2ce3`.
 
 - CI on the fork (public, so Actions are free): `cargo test --lib --release`,
   the abi3 build, `build.sh` + `matrix.py`, `attach_probe.py`, `leak.py`.
-- The regression tests `JOURNAL.md` requires before talking to upstream.
+- A regression test for every ledger row before talking to upstream.
 - A comment on PyO3#3451 with the measurements and the design, split into
   reviewable pieces (`InterpreterHandle` first, since it is orthogonal).
 
