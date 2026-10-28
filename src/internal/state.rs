@@ -163,7 +163,7 @@ impl AttachGuard {
             match crate::internal::home::foreign_target() {
                 crate::internal::home::ForeignTarget::Gilstate => {}
                 crate::internal::home::ForeignTarget::Home(interp) => {
-                    // SAFETY: the home is alive (cleared by its teardown hook) and this
+                    // SAFETY: the home is alive (cleared when its registry is dropped) and this
                     // thread has no thread state.
                     let tstate = unsafe { crate::internal::home::attach_home(interp) };
                     increment_attach_count();
@@ -420,7 +420,7 @@ impl ReferencePool {
 // to A's refcount while A ran under its own GIL (`subinterp-bench/BUG-POOL.md`).
 //
 // So each deferred decref goes to its owner's pool, and a pool is drained only by an attach to
-// its own interpreter, or emptied by that interpreter's teardown hook. The owner has to be known
+// its own interpreter, or emptied when that interpreter's registry is dropped. The owner has to be known
 // when the object is queued (`owner_now`): at drain time it can no longer be recovered.
 //
 // The main interpreter's pool is the static `POOL`, as upstream's single pool was; the other
@@ -603,7 +603,7 @@ fn drop_deferred_references_slow(py: Python<'_>) {
     pool.drop_deferred_references(py);
 }
 
-/// Called from the per-interpreter teardown hook, attached to the interpreter being destroyed:
+/// Called when an interpreter's registry is dropped, attached to that interpreter:
 /// removes its pool and applies the decrefs still queued in it.
 pub(crate) fn drain_pool_on_teardown(py: Python<'_>) {
     #[cfg(not(pyo3_disable_reference_pool))]
@@ -733,8 +733,7 @@ pub(crate) fn is_in_gc_traversal() -> bool {
 }
 
 /// Marks the thread as attached for the duration of a callback that CPython makes into Rust
-/// *without* going through PyO3 — a capsule destructor, or an `atexit` hook installed as a raw
-/// `PyMethodDef`.
+/// *without* going through PyO3, such as a capsule destructor.
 ///
 /// Such a callback runs with a thread state current, but PyO3 never saw the transition, so
 /// [`thread_is_attached`] reports `false` and every `Py<T>` dropped inside it defers its decref
