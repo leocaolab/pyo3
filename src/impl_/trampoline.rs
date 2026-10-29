@@ -2,8 +2,9 @@
 
 //! Trampolines for various pyfunction and pymethod implementations.
 //!
-//! They exist to monomorphise std::panic::catch_unwind once into PyO3, rather than inline in every
-//! function, thus saving a huge amount of compile-time complexity.
+//! Each trampoline is instantiated once per wrapped function, so the call to the wrapped function
+//! is direct and can be inlined. Sharing one instantiation per signature instead would put an
+//! indirect call, and the `PyResult` it returns through memory, on every call.
 
 #[cfg(wip_feature_std)]
 use core::any::Any;
@@ -85,23 +86,12 @@ macro_rules! trampoline {
             $($arg_names: $arg_types,)*
         ) -> $ret {
             // SAFETY: caller upholds requirements
-            unsafe { $name::inner($($arg_names),*, Meth::METH) }
+            unsafe { trampoline(|py| Meth::METH(py, $($arg_names,)*)) }
         }
 
         /// Companion module contains the function pointer type.
         pub mod $name {
             use super::*;
-
-            /// Non-generic inner function to ensure only one trampoline instantiated
-            ///
-            /// # Safety
-            ///
-            /// The interpreter must be attached
-            #[inline]
-            pub(crate) unsafe fn inner($($arg_names: $arg_types),*, f: $name::Func) -> $ret {
-                // SAFETY: caller upholds requirements
-                unsafe { trampoline(|py| f(py, $($arg_names,)*)) }
-            }
 
             /// The type of the function pointer for this trampoline.
             pub type Func = for<'py> unsafe fn (Python<'py>, $($arg_types),*) -> PyResult<$ret>;
@@ -118,20 +108,11 @@ pub unsafe extern "C" fn noargs<Meth: MethodDef<noargs::Func>>(
     _args: *mut ffi::PyObject, // unused and value not defined
 ) -> *mut ffi::PyObject {
     // SAFETY: caller upholds requirements
-    unsafe { noargs::inner(slf, Meth::METH) }
+    unsafe { trampoline(|py| Meth::METH(py, slf)) }
 }
 
 pub mod noargs {
     use super::*;
-
-    /// # Safety
-    ///
-    /// Interpreter must be attached
-    #[inline]
-    pub(crate) unsafe fn inner(slf: *mut ffi::PyObject, f: Func) -> *mut ffi::PyObject {
-        // SAFETY: caller upholds requirements
-        unsafe { trampoline(|py| f(py, slf)) }
-    }
 
     pub type Func = unsafe fn(Python<'_>, *mut ffi::PyObject) -> PyResult<*mut ffi::PyObject>;
 }
@@ -247,22 +228,12 @@ pub unsafe extern "C" fn releasebufferproc<Meth: MethodDef<releasebufferproc::Fu
     buf: *mut ffi::Py_buffer,
 ) {
     // SAFETY: caller upholds requirements
-    unsafe { releasebufferproc::inner(slf, buf, Meth::METH) }
+    unsafe { trampoline_unraisable(|py| Meth::METH(py, slf, buf), slf) }
 }
 
 #[cfg(any(not(Py_LIMITED_API), Py_3_11))]
 pub mod releasebufferproc {
     use super::*;
-
-    /// # Safety
-    ///
-    /// - It must be sound to call f with slf and buf
-    /// - Interpreter must be attached
-    #[inline]
-    pub(crate) unsafe fn inner(slf: *mut ffi::PyObject, buf: *mut ffi::Py_buffer, f: Func) {
-        // SAFETY: caller upholds requirements
-        unsafe { trampoline_unraisable(|py| f(py, slf, buf), slf) }
-    }
 
     pub type Func = unsafe fn(Python<'_>, *mut ffi::PyObject, *mut ffi::Py_buffer) -> PyResult<()>;
 }
