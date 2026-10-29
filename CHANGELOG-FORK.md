@@ -17,7 +17,7 @@ Changes in this fork relative to upstream PyO3. Upstream's own changes are in
 The goal is own-GIL sub-interpreters (PEP 684): one extension used by several
 interpreters in one process, each running under its own GIL.
 
-## Unreleased
+## `subinterp-2026-10-28.1`
 
 ### Fixed
 
