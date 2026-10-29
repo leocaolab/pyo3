@@ -165,6 +165,38 @@ macro_rules! maybe_extract_arguments_fastcall {
 
 pub use crate::maybe_extract_arguments_fastcall;
 
+#[cfg(any(Py_3_10, not(Py_LIMITED_API)))]
+#[macro_export]
+#[doc(hidden)]
+macro_rules! maybe_extract_positional_arguments_fastcall {
+    ($description:ident, $py:ident, $args:ident, $nargs:ident, $kwargs:ident, $num_params:expr) => {
+        // SAFETY: guaranteed by the proc macro that all args to extract_positional_arguments_fastcall are valid
+        unsafe {
+            $description
+                .extract_positional_arguments_fastcall::<$num_params>($py, $args, $nargs, $kwargs)
+        }
+    };
+}
+
+#[cfg(not(any(Py_3_10, not(Py_LIMITED_API))))]
+#[macro_export]
+#[doc(hidden)]
+macro_rules! maybe_extract_positional_arguments_fastcall {
+    ($description:ident, $py:ident, $args:ident, $nargs:ident, $kwargs:ident, $num_params:expr) => {{
+        let mut output = [::core::option::Option::None; $num_params];
+        // SAFETY: guaranteed by the proc macro that all args to extract_arguments_tuple_dict are valid
+        unsafe {
+            $description.extract_arguments_tuple_dict::<
+                $crate::impl_::extract_argument::NoVarargs,
+                $crate::impl_::extract_argument::NoVarkeywords,
+            >($py, $args, $kwargs, &mut output)
+        }
+        .map(|((), ())| output)
+    }};
+}
+
+pub use crate::maybe_extract_positional_arguments_fastcall;
+
 impl PyMethodDef {
     /// Define a function that takes no arguments.
     pub const fn noargs(

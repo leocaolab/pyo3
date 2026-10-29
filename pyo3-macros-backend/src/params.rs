@@ -144,9 +144,25 @@ pub fn impl_arg_params(
     };
     let python_name = &spec.python_name;
 
-    let extract_expression = if fastcall {
+    let python_signature = &spec.signature.python_signature;
+    let positional_only = python_signature.varargs.is_none()
+        && python_signature.kwargs.is_none()
+        && python_signature.keyword_only_parameters.is_empty();
+    let extract_statement = if fastcall && positional_only {
         quote! {
-            #pyo3_path::impl_::pymethods::maybe_extract_arguments_fastcall!(
+            let #args_array = #pyo3_path::impl_::pymethods::maybe_extract_positional_arguments_fastcall!(
+                DESCRIPTION,
+                py,
+                _args,
+                _nargs,
+                _kwargs,
+                #num_params
+            )?;
+        }
+    } else if fastcall {
+        quote! {
+            let mut #args_array = [::core::option::Option::None; #num_params];
+            let (_args, _kwargs) = #pyo3_path::impl_::pymethods::maybe_extract_arguments_fastcall!(
                 DESCRIPTION,
                 py,
                 _args,
@@ -155,16 +171,17 @@ pub fn impl_arg_params(
                 #args_array,
                 #args_handler,
                 #kwargs_handler
-            )?
+            )?;
         }
     } else {
         quote! {
-            DESCRIPTION.extract_arguments_tuple_dict::<#args_handler, #kwargs_handler>(
+            let mut #args_array = [::core::option::Option::None; #num_params];
+            let (_args, _kwargs) = DESCRIPTION.extract_arguments_tuple_dict::<#args_handler, #kwargs_handler>(
                 py,
                 _args,
                 _kwargs,
                 &mut #args_array
-            )?
+            )?;
         }
     };
 
@@ -180,8 +197,7 @@ pub fn impl_arg_params(
                         #required_positional_parameters,
                         &[#(#keyword_only_parameters),*],
                     );
-                let mut #args_array = [::core::option::Option::None; #num_params];
-                let (_args, _kwargs) = #extract_expression;
+                #extract_statement
                 #from_py_with
         },
         param_conversion,

@@ -17,6 +17,24 @@ Changes in this fork relative to upstream PyO3. Upstream's own changes are in
 The goal is own-GIL sub-interpreters (PEP 684): one extension used by several
 interpreters in one process, each running under its own GIL.
 
+## Unreleased
+
+### Changed
+
+- The call boundary of a wrapped function costs fewer instructions. Called from C with one `str`
+  argument, `#[pyfunction] fn write(text: &str)` went from 371 to 256 user-space instructions per
+  call on x86_64 (Linux, Python 3.14) and from 390 to 277 on aarch64 (macOS), against 238 and 241
+  for a hand-written `METH_FASTCALL` function doing the same; no allocation before or after. Three
+  changes, none of which changes what a call does:
+  - each trampoline is instantiated per wrapped function, so the body is a direct call that LLVM
+    can inline, instead of an indirect call returning `PyResult` through memory (+4.3% `.text`
+    for the `pytests` module, about 140 bytes per wrapped function on x86_64);
+  - a function whose parameters are all positional binds a call with exactly that many positional
+    arguments and no keywords by copying them; every other call goes through the general binder as
+    before (`FunctionDescription::extract_positional_arguments_fastcall`);
+  - the trampoline's panic trap has no fields and its `AttachGuard` is released explicitly, so
+    neither is stored to the stack on every call.
+
 ## `subinterp-2026-10-28.1`
 
 ### Fixed
