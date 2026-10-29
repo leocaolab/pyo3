@@ -643,6 +643,46 @@ impl FunctionDescription {
         Ok((varargs, varkeywords))
     }
 
+    /// Equivalent of `extract_arguments_fastcall` for a function whose `N` parameters are all
+    /// positional, with no `*args`, `**kwargs` or keyword-only parameter.
+    ///
+    /// A call with exactly `N` positional arguments and no keywords is bound by copying them, the
+    /// only thing `extract_arguments_fastcall` would do for it; every other call is bound by
+    /// `extract_arguments_fastcall`, so it fails with the same errors.
+    ///
+    /// # Safety
+    /// The same as `extract_arguments_fastcall`.
+    #[cfg(any(Py_3_10, not(Py_LIMITED_API)))]
+    pub unsafe fn extract_positional_arguments_fastcall<'py, const N: usize>(
+        &self,
+        py: Python<'py>,
+        args: *const *mut ffi::PyObject,
+        nargs: ffi::Py_ssize_t,
+        kwnames: *mut ffi::PyObject,
+    ) -> PyResult<[Option<PyArg<'py>>; N]> {
+        debug_assert_eq!(self.positional_parameter_names.len(), N);
+        debug_assert!(self.keyword_only_parameters.is_empty());
+
+        if kwnames.is_null() && nargs == N as ffi::Py_ssize_t {
+            let args: *const Option<PyArg<'py>> = args.cast();
+            // SAFETY: `args` holds `nargs == N` valid references, which the caller lets us borrow
+            // for `'py`, and `Option<PyArg>` has the layout of `*mut ffi::PyObject`.
+            return Ok(core::array::from_fn(|i| unsafe { *args.add(i) }));
+        }
+        let mut output = [None; N];
+        // SAFETY: the caller upholds the requirements of `extract_arguments_fastcall`.
+        unsafe {
+            self.extract_arguments_fastcall::<NoVarargs, NoVarkeywords>(
+                py,
+                args,
+                nargs,
+                kwnames,
+                &mut output,
+            )
+        }?;
+        Ok(output)
+    }
+
     /// Extracts the `args` and `kwargs` provided into `output`, according to this function
     /// definition.
     ///
@@ -1207,6 +1247,79 @@ mod tests {
                 err.to_string(),
                 "TypeError: example() missing 2 required positional arguments: 'foo' and 'bar'"
             );
+        })
+    }
+
+    #[test]
+    #[cfg(any(Py_3_10, not(Py_LIMITED_API)))]
+    fn positional_fastcall_binds_every_call_like_the_general_fastcall() {
+        use crate::{ffi, Bound, IntoPyObject, PyAny, PyErr};
+
+        let function_description = FunctionDescription {
+            cls_name: None,
+            func_name: "example",
+            positional_parameter_names: &["foo", "bar"],
+            positional_only_parameters: 0,
+            required_positional_parameters: 1,
+            keyword_only_parameters: &[],
+        };
+
+        Python::attach(|py| {
+            let values: Vec<Bound<'_, PyAny>> = (0u8..4)
+                .map(|i| i.into_pyobject(py).unwrap().into_any())
+                .collect();
+            let args: Vec<*mut ffi::PyObject> = values.iter().map(Bound::as_ptr).collect();
+            let names = |names: &[&str]| PyTuple::new(py, names).unwrap();
+            let calls = [
+                (0, None),
+                (1, None),
+                (2, None),
+                (3, None),
+                (2, Some(names(&[]))),
+                (0, Some(names(&["foo"]))),
+                (0, Some(names(&["foo", "bar"]))),
+                (1, Some(names(&["bar"]))),
+                (1, Some(names(&["foo"]))),
+                (1, Some(names(&["baz"]))),
+            ];
+
+            let bound = |result: Result<(), PyErr>, output: [Option<super::PyArg<'_>>; 2]| {
+                result
+                    .map(|()| output.map(|arg| arg.map(|arg| arg.as_ptr())))
+                    .map_err(|err| err.to_string())
+            };
+            for (nargs, kwnames) in calls {
+                let kwnames_ptr = kwnames
+                    .as_ref()
+                    .map_or(core::ptr::null_mut(), |kwnames| kwnames.as_ptr());
+                let mut general = [None, None];
+                let general_result = unsafe {
+                    function_description
+                        .extract_arguments_fastcall::<NoVarargs, NoVarkeywords>(
+                            py,
+                            args.as_ptr(),
+                            nargs,
+                            kwnames_ptr,
+                            &mut general,
+                        )
+                        .map(|((), ())| ())
+                };
+                let positional = unsafe {
+                    function_description.extract_positional_arguments_fastcall::<2>(
+                        py,
+                        args.as_ptr(),
+                        nargs,
+                        kwnames_ptr,
+                    )
+                };
+                assert_eq!(
+                    positional
+                        .map(|output| output.map(|arg| arg.map(|arg| arg.as_ptr())))
+                        .map_err(|err| err.to_string()),
+                    bound(general_result, general),
+                    "nargs = {nargs}, kwnames = {kwnames:?}"
+                );
+            }
         })
     }
 
