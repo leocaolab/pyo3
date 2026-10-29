@@ -8,7 +8,7 @@
 
 #[cfg(wip_feature_std)]
 use core::any::Any;
-use core::{ffi::c_int, panic::UnwindSafe};
+use core::{ffi::c_int, mem::ManuallyDrop, panic::UnwindSafe};
 
 use crate::internal::state::AttachGuard;
 #[cfg(wip_feature_std)]
@@ -19,8 +19,8 @@ use crate::panic::PanicException;
 )]
 use crate::platform::prelude::*;
 use crate::{
-    ffi, ffi_ptr_ext::FfiPtrExt, impl_::callback::PyCallbackOutput, impl_::panic::PanicTrap,
-    types::PyModule, Bound, PyResult, Python,
+    ffi, ffi_ptr_ext::FfiPtrExt, impl_::callback::PyCallbackOutput, types::PyModule, Bound,
+    PyResult, Python,
 };
 
 #[inline]
@@ -278,10 +278,10 @@ where
     F: for<'py> FnOnce(Python<'py>) -> PyResult<R> + UnwindSafe,
     R: PyCallbackOutput,
 {
-    let trap = PanicTrap::new("uncaught panic at ffi boundary");
+    let trap = BoundaryTrap;
 
     // SAFETY: This function requires the thread to already be attached.
-    let guard = unsafe { AttachGuard::assume() };
+    let guard = ManuallyDrop::new(unsafe { AttachGuard::assume() });
     let py = guard.python();
     let out = cfg_select! {
         wip_feature_std => panic_result_into_callback_output(
@@ -291,7 +291,29 @@ where
         _ => result_into_callback_output(py, body(py)),
     };
     trap.disarm();
+    drop(ManuallyDrop::into_inner(guard));
     out
+}
+
+/// Aborts the process when a panic unwinds past it, like `PanicTrap` with a fixed message.
+///
+/// It has no fields, so a trampoline does not store anything for it on every call, and the
+/// `AttachGuard` beside it is never released by unwinding: a landing pad that released it would
+/// only run before this aborts, and would keep the guard on the stack instead of in a register.
+struct BoundaryTrap;
+
+impl BoundaryTrap {
+    #[inline]
+    fn disarm(self) {
+        core::mem::forget(self)
+    }
+}
+
+impl Drop for BoundaryTrap {
+    fn drop(&mut self) {
+        // Panicking while unwinding aborts the process.
+        panic!("uncaught panic at ffi boundary")
+    }
 }
 
 /// Converts the output of std::panic::catch_unwind into a Python function output, either by raising a Python
@@ -342,10 +364,10 @@ unsafe fn trampoline_unraisable<F>(body: F, ctx: *mut ffi::PyObject)
 where
     F: for<'py> FnOnce(Python<'py>) -> PyResult<()> + UnwindSafe,
 {
-    let trap = PanicTrap::new("uncaught panic at ffi boundary");
+    let trap = BoundaryTrap;
 
     // SAFETY: Thread is known to be attached.
-    let guard = unsafe { AttachGuard::assume() };
+    let guard = ManuallyDrop::new(unsafe { AttachGuard::assume() });
     let py = guard.python();
 
     let result = cfg_select! {
@@ -360,4 +382,5 @@ where
         py_err.write_unraisable(py, unsafe { ctx.assume_borrowed_or_opt(py) }.as_deref());
     }
     trap.disarm();
+    drop(ManuallyDrop::into_inner(guard));
 }
