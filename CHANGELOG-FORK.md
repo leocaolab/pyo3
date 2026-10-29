@@ -17,6 +17,33 @@ Changes in this fork relative to upstream PyO3. Upstream's own changes are in
 The goal is own-GIL sub-interpreters (PEP 684): one extension used by several
 interpreters in one process, each running under its own GIL.
 
+## Unreleased
+
+### Fixed
+
+- Making an interpreter's per-interpreter registry (the first `PerInterpreterCell`, `#[pyclass]`
+  or `PyOnceLock` value there) no longer runs Python code or clears errors. It used to register a
+  teardown hook through `import atexit` and `import gc`, and bytecode is where an exception set
+  on the thread for later (`PyThreadState_SetAsyncExc`, an interrupt from another thread) is
+  raised: one pending at the first fill was raised inside that import and cleared, so it never
+  reached the caller. Ledger row #30.
+- A registry that cannot be made (no interpreter dict, or out of memory) is reported to
+  `sys.unraisablehook` with the exception CPython raised, instead of being cleared; the value is
+  still handed out, unstored, as before.
+
+### Changed
+
+- There is no `atexit` hook. An interpreter's registry is dropped when CPython clears the
+  interpreter dict (`interpreter_clear`, right before its last garbage collection), and that drop
+  now marks the home interpreter gone and applies the interpreter's deferred decrefs. The
+  collection that follows reclaims the cycles the hook's three `gc.collect()` passes did
+  (3.14 `leak.py` and `reclaim.py` unchanged). Values are therefore dropped after
+  `finalize_modules` rather than before it. `PyUnstable_AtExit` callbacks run later still, after
+  the dict is cleared, and are not in the limited API, so they are not used.
+- Regression tests `tests/test_subinterp_pending_exception.rs` (an exception set before the first
+  fill still lands) and `a_cycle_a_cell_held_is_collected_when_the_interpreter_ends` in
+  `tests/test_subinterp_teardown.rs`; the first is in the `subinterp` CI job.
+
 ## `subinterp-2026-10-22.1`
 
 To use it:

@@ -105,7 +105,7 @@ pub(crate) unsafe fn note_module_exec() {
     *st = (home as usize, flags);
 }
 
-/// Called from the per-interpreter teardown hook: forget `interp` if it is home.
+/// Called when `interp`'s registry is dropped: forget `interp` if it is home.
 pub(crate) fn on_interpreter_teardown(interp: *mut ffi::PyInterpreterState) {
     let mut st = lock();
     if st.0 == interp as usize {

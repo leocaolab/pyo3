@@ -47,7 +47,7 @@ jobs:
         env:
           PYO3_PYTHON: python
       - name: sub-interpreter regression binaries (one process each; they set the home interpreter)
-        run: cargo test --release --test test_subinterp_isolation --test test_subinterp_home --test test_subinterp_shared --test test_subinterp_teardown --test test_subinterp_identity
+        run: cargo test --release --test test_subinterp_isolation --test test_subinterp_home --test test_subinterp_shared --test test_subinterp_teardown --test test_subinterp_identity --test test_subinterp_pending_exception
         env:
           PYO3_PYTHON: python
 
